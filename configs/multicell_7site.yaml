@@ -40,9 +40,9 @@ scheduler:
 
 link_adaptation:
   bler_target: 0.1
-  olla_delta_up: 1.0
-  olla_offset_min: -20.0
-  olla_offset_max: 20.0
+  olla_delta_up: 0.5
+  olla_offset_min: -10.0
+  olla_offset_max: 10.0
   mcs_table_index: 1
 
 traffic:

@@ -219,38 +219,38 @@ class SimulationEngine:
         for ue_idx, ue in enumerate(self.ue_states):
             ue.selected_rank = int(ue_rank[ue_idx])
 
-        # 4. 有效 SINR 计算 (per UE, 用全带宽估计)
+        # 4. OLLA: 只对上一 TTI 被调度的 UE 更新偏移
+        self.olla.update_offsets_batch(
+            self._last_harq_ack, self._last_scheduled_mask
+        )
+
+        # 5. MCS 选择
         sinr_eff_db = np.zeros(num_ue)
+        est_prbs = np.full(num_ue, max(num_prb // num_ue, 1), dtype=np.int32)
+
+        # EESM: 使用 MCS 0 的 beta (保守估计, 避免高估 SINR)
         for ue in range(num_ue):
             r = int(ue_rank[ue])
             sinr_eff_db[ue] = self.eesm.compute(
                 channel_state.sinr_per_prb[ue, :r, :],
-                mcs_index=0,  # 初始用 MCS 0 的 beta 估计
+                mcs_index=0,
                 table_index=self.la_config.mcs_table_index
             )
 
-        # 5. OLLA: 只对上一 TTI 被调度的 UE 更新偏移
-        self.olla.update_offsets_batch(
-            self._last_harq_ack, self._last_scheduled_mask
-        )
-        # 用平均 PRB 数估计 MCS (全带宽 / num_ue)
-        est_prbs = np.full(num_ue, max(num_prb // num_ue, 1), dtype=np.int32)
+        # OLLA 选择 MCS (内部 ILLA 会用 BLER 表逐 MCS 查找)
         mcs_indices = self.olla.select_mcs(sinr_eff_db, est_prbs, ue_rank)
 
         # 6. 计算 per-PRB 可达速率 (用于 PF metric)
+        #    使用 Shannon 容量作为 per-PRB 速率估计, 避免与 MCS 耦合
         achievable_rate_per_prb = np.zeros((num_ue, num_prb))
+        re_per_prb = self.resource_grid.num_re_per_prb
         for ue in range(num_ue):
-            se = get_spectral_efficiency(int(mcs_indices[ue]),
-                                         self.la_config.mcs_table_index)
-            # 每 PRB 可达比特数 = SE × RE_per_PRB × layers
-            bits_per_prb = se * self.resource_grid.num_re_per_prb * int(ue_rank[ue])
-            # 乘以 per-PRB 信道质量的相对变化
-            mean_sinr = np.mean(channel_state.sinr_per_prb[ue, 0, :])
-            if mean_sinr > 0:
-                rel_quality = channel_state.sinr_per_prb[ue, 0, :] / mean_sinr
-            else:
-                rel_quality = np.ones(num_prb)
-            achievable_rate_per_prb[ue, :] = bits_per_prb * rel_quality
+            r = int(ue_rank[ue])
+            # per-PRB Shannon 容量 (考虑 rank)
+            sinr_prb = channel_state.sinr_per_prb[ue, :r, :]  # (rank, num_prb)
+            # 各层的 log2(1+SINR) 求和, 乘以 RE 数
+            capacity_per_prb = np.sum(np.log2(1.0 + np.maximum(sinr_prb, 0)), axis=0)
+            achievable_rate_per_prb[ue, :] = capacity_per_prb * re_per_prb
 
         # 7. PF 调度
         ue_buffer = np.array([ue.buffer_bytes for ue in self.ue_states])
@@ -260,7 +260,7 @@ class SimulationEngine:
             mcs_indices, ue_rank
         )
 
-        # 8. 重新计算被调度 UE 的精确有效 SINR 和 MCS
+        # 8. 被调度 UE: 用实际分配 PRB 重新计算精确 EESM
         for ue in range(num_ue):
             if sched.ue_num_prbs[ue] > 0:
                 r = int(ue_rank[ue])

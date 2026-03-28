@@ -278,12 +278,14 @@ class MultiCellSimulationEngine:
         est_prbs = np.full(num_ue, max(num_prb // num_ue, 1), dtype=np.int32)
         mcs_indices = olla.select_mcs(sinr_eff_db, est_prbs, ue_rank)
 
-        # PF 调度
+        # PF 调度: 使用 Shannon 容量 (含 rank)
         achievable = np.zeros((num_ue, num_prb))
+        re_per_prb = self.resource_grid.num_re_per_prb
         for ue in range(num_ue):
-            se = get_spectral_efficiency(int(mcs_indices[ue]),
-                                         self.la_config.mcs_table_index)
-            achievable[ue, :] = se * self.resource_grid.num_re_per_prb
+            r = int(ue_rank[ue])
+            sinr_prb = sinr_per_prb[ue, :r, :]
+            capacity = np.sum(np.log2(1.0 + np.maximum(sinr_prb, 0)), axis=0)
+            achievable[ue, :] = capacity * re_per_prb
 
         ue_buffer = np.array([u.buffer_bytes for u in ue_states])
         sched = scheduler.schedule(

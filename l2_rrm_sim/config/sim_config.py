@@ -76,9 +76,9 @@ class SchedulerConfig:
 class LinkAdaptationConfig:
     """链路自适应配置"""
     bler_target: float = 0.1           # 目标 BLER
-    olla_delta_up: float = 1.0         # OLLA NACK 步长 (dB)
-    olla_offset_min: float = -20.0     # OLLA 偏移下限 (dB)
-    olla_offset_max: float = 20.0      # OLLA 偏移上限 (dB)
+    olla_delta_up: float = 0.5         # OLLA NACK 步长 (dB)
+    olla_offset_min: float = -10.0     # OLLA 偏移下限 (dB)
+    olla_offset_max: float = 10.0      # OLLA 偏移上限 (dB)
     mcs_table_index: int = 1           # MCS 表索引
 
 

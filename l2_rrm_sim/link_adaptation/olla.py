@@ -2,9 +2,14 @@
 
 根据 HARQ 反馈调整 SINR 偏移量，使实际 BLER 收敛到目标值。
 
-收敛条件:
+收敛条件 (稳态):
     P(NACK) × delta_up = P(ACK) × delta_down
     => delta_down = delta_up × bler_target / (1 - bler_target)
+
+对齐 Sionna 实现:
+    ACK → offset -= delta_down (更激进, 尝试更高 MCS)
+    NACK → offset += delta_up (更保守, 降低 MCS)
+    adjusted_sinr = sinr_eff - offset
 """
 
 import numpy as np
@@ -15,19 +20,23 @@ class OLLA:
     """外环链路自适应
 
     维护每 UE 的 SINR 偏移量 (offset_db)。
-    ACK 时减小偏移 (更激进), NACK 时增大偏移 (更保守)。
     """
 
     def __init__(self, num_ue: int, illa: ILLA,
                  bler_target: float = 0.1,
-                 delta_up: float = 1.0,
-                 offset_min: float = -20.0,
-                 offset_max: float = 20.0):
+                 delta_up: float = 0.5,
+                 offset_min: float = -10.0,
+                 offset_max: float = 10.0):
+        """
+        Args:
+            delta_up: NACK 时偏移增加量 (dB), 较保守的默认值
+            offset_min/max: 偏移范围 (dB), [-10, 10] 更合理
+        """
         self.num_ue = num_ue
         self.illa = illa
         self.bler_target = bler_target
         self.delta_up = delta_up
-        # 收敛条件: delta_down = delta_up × bler_target / (1 - bler_target)
+        # 收敛条件: delta_down / delta_up = bler_target / (1 - bler_target)
         self.delta_down = delta_up * bler_target / (1.0 - bler_target)
         self.offset_min = offset_min
         self.offset_max = offset_max
@@ -51,12 +60,7 @@ class OLLA:
 
     def update_offsets_batch(self, harq_ack: np.ndarray,
                             scheduled_mask: np.ndarray = None):
-        """批量更新所有 UE 的偏移量
-
-        Args:
-            harq_ack: (num_ue,) bool 数组, True=ACK, False=NACK
-            scheduled_mask: (num_ue,) bool 数组, 只更新被调度的 UE
-        """
+        """批量更新被调度 UE 的偏移量"""
         if scheduled_mask is None:
             scheduled_mask = np.ones(self.num_ue, dtype=bool)
         scheduled = scheduled_mask.astype(bool)
@@ -69,22 +73,12 @@ class OLLA:
     def select_mcs(self, sinr_eff_db: np.ndarray,
                    num_allocated_prbs: np.ndarray = None,
                    num_layers: np.ndarray = None) -> np.ndarray:
-        """使用 OLLA 调整后的 SINR 选择 MCS
-
-        Args:
-            sinr_eff_db: (num_ue,) 有效 SINR [dB]
-            num_allocated_prbs: (num_ue,) 分配的 PRB 数
-            num_layers: (num_ue,) 传输层数
-
-        Returns:
-            (num_ue,) MCS indices
-        """
+        """使用 OLLA 调整后的 SINR 选择 MCS"""
         if num_allocated_prbs is None:
             num_allocated_prbs = np.ones(self.num_ue, dtype=np.int32)
         if num_layers is None:
             num_layers = np.ones(self.num_ue, dtype=np.int32)
 
-        # 调整 SINR
         adjusted_sinr = sinr_eff_db - self._offset
 
         mcs_indices = np.zeros(self.num_ue, dtype=np.int32)

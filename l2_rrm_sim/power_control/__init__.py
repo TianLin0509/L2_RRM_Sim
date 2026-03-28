@@ -1,1 +1,1 @@
-# 功率控制模块 (Phase 3)
+from .dl_power_control import DLPowerControl

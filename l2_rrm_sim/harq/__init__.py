@@ -1,1 +1,2 @@
-# HARQ 模块 (Phase 3)
+from .harq_entity import HARQEntity, HARQProcess
+from .harq_buffer import HARQManager

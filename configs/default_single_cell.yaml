@@ -1,0 +1,55 @@
+## L2 RRM 仿真 — 默认单小区配置
+## 100MHz@30kHz, 3.5GHz, UMa, 20 UE, Full Buffer
+
+sim:
+  num_slots: 5000
+  random_seed: 42
+  warmup_slots: 500
+  kpi_trim_percent: 5.0
+
+carrier:
+  subcarrier_spacing: 30        # kHz (15/30/60/120)
+  num_prb: 273                  # 100 MHz @ 30 kHz SCS
+  bandwidth_mhz: 100.0
+  carrier_freq_ghz: 3.5
+  num_pdcch_symbols: 2
+  dmrs_type: 1
+  dmrs_cdm_groups: 2
+  num_dmrs_symbols: 1
+
+cell:
+  num_tx_ant: 64
+  num_tx_ports: 4
+  max_layers: 4
+  total_power_dbm: 46.0
+  cell_radius_m: 500.0
+  height_m: 25.0
+  scenario: uma
+  noise_figure_db: 5.0
+
+ue:
+  num_ue: 20
+  num_rx_ant: 4
+  min_distance_m: 35.0
+  max_distance_m: 500.0
+  height_m: 1.5
+  speed_kmh: 3.0
+
+scheduler:
+  type: pf
+  beta: 0.98
+
+link_adaptation:
+  bler_target: 0.1
+  olla_delta_up: 1.0
+  olla_offset_min: -20.0
+  olla_offset_max: 20.0
+  mcs_table_index: 1
+
+traffic:
+  type: full_buffer
+
+channel:
+  type: statistical
+  scenario: uma
+  shadow_fading_std_db: 4.0

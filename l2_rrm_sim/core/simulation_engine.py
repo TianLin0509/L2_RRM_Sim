@@ -48,6 +48,23 @@ class SimulationEngine:
         self.channel_config: ChannelConfig = config['channel']
         self.csi_config: CSIConfig = config.get('csi', CSIConfig())
 
+        # TDD 配置
+        from ..config.sim_config import TDDConfig as TDDCfg
+        tdd_cfg = config.get('tdd', TDDCfg())
+        self._is_tdd = (tdd_cfg.duplex_mode.upper() == 'TDD')
+        if self._is_tdd:
+            from .tdd_config import TDDConfig
+            self.tdd = TDDConfig(
+                pattern=tdd_cfg.pattern,
+                special_dl_symbols=tdd_cfg.special_dl_symbols,
+                special_gp_symbols=tdd_cfg.special_gp_symbols,
+                special_ul_symbols=tdd_cfg.special_ul_symbols,
+            )
+            self._harq_k1 = tdd_cfg.harq_k1
+        else:
+            self.tdd = None
+            self._harq_k1 = 4
+
         # 随机数
         self.rng = SimRNG(self.sim_config.random_seed)
 
@@ -226,12 +243,22 @@ class SimulationEngine:
         slots_per_frame = SLOTS_PER_FRAME[mu]
         slots_per_subframe = SLOTS_PER_SUBFRAME[mu]
 
+        # TDD 方向
+        if self._is_tdd:
+            direction = self.tdd.get_slot_direction(slot_idx)
+            dl_symbols = self.tdd.get_dl_symbols(slot_idx)
+        else:
+            direction = 'D'
+            dl_symbols = 14
+
         return SlotContext(
             slot_idx=slot_idx,
             time_s=slot_idx * self.carrier_config.slot_duration_s,
             frame_idx=slot_idx // slots_per_frame,
             subframe_idx=(slot_idx % slots_per_frame) // slots_per_subframe,
             slot_in_subframe=slot_idx % slots_per_subframe,
+            slot_direction=direction,
+            num_dl_symbols=dl_symbols,
         )
 
     def run(self) -> dict:
@@ -286,6 +313,21 @@ class SimulationEngine:
         num_ue = self.num_ue
         num_prb = self.carrier_config.num_prb
 
+        # TDD: UL slot 跳过 DL 调度 (流量仍生成, UE 仍移动)
+        if slot_ctx.slot_direction == 'U':
+            self.traffic.generate(slot_ctx, self.ue_states)
+            self._buf_after_traffic = np.array(
+                [ue.buffer_bytes for ue in self.ue_states], dtype=np.int64)
+            return SlotResult(
+                slot_idx=slot_idx,
+                ue_decoded_bits=np.zeros(num_ue, dtype=np.int64),
+                ue_bler=np.zeros(num_ue), ue_tb_success=np.zeros(num_ue, dtype=bool),
+                ue_mcs=np.zeros(num_ue, dtype=np.int32),
+                ue_rank=np.ones(num_ue, dtype=np.int32),
+                ue_sinr_eff_db=np.full(num_ue, -30.0),
+                ue_throughput_inst=np.zeros(num_ue),
+            )
+
         # 1. 流量生成
         self.traffic.generate(slot_ctx, self.ue_states)
 
@@ -306,6 +348,15 @@ class SimulationEngine:
                 and hasattr(self.channel, 'initialize')
                 and self.channel_config.type.lower() == 'sionna'):
             self.channel.initialize(self.cell_config, self.carrier_config, self.ue_states)
+
+        # 2.5 HARQ K1: 交付到期的反馈 (在调度前)
+        delivered = self.harq_mgr.deliver_feedback(slot_idx)
+        if delivered:
+            for ue_id, fb_result in delivered:
+                if fb_result.get('is_final_ack'):
+                    self._last_harq[ue_id] = 1  # ACK
+                elif fb_result.get('retx_needed'):
+                    self._last_harq[ue_id] = 0  # NACK
 
         # 信道更新
         channel_state = self.channel.update(slot_ctx, self.ue_states)
@@ -363,6 +414,9 @@ class SimulationEngine:
         re_per_prb = self.resource_grid.num_re_per_prb
         slot_idx = slot_ctx.slot_idx
 
+        # 初始 MCS (基于宽带 SINR 的保守估计，随后由 OLLA/CQI 细化)
+        mcs_indices = np.zeros(num_ue, dtype=np.int32)
+
         # --- SINR 预估 (CSI-based) ---
         sinr_eff_for_olla = self._last_sinr_eff.copy()
         if self._csi_enabled and channel_state.actual_channel_matrix is not None:
@@ -378,13 +432,10 @@ class SimulationEngine:
                 if csi_reports[ue] is not None and sinr_pred_db[ue] > -29:
                     # 模拟 UE 端 SINR -> CQI -> gNB 端 MCS
                     cqi = sinr_to_cqi(sinr_pred_db[ue])
-                    # gNB 根据反馈的 CQI 粗选一个 MCS，再加上 OLLA 补偿
-                    mcs_from_cqi = cqi_to_mcs(cqi)
-                    mcs_indices[ue] = mcs_from_cqi
-                    
+                    mcs_indices[ue] = cqi_to_mcs(cqi)
                     sinr_eff_for_olla[ue] = db_to_linear(sinr_pred_db[ue])
 
-        # --- MCS 选择 (OLLA) ---
+        # --- MCS 优化 (基于 OLLA 进一步细化) ---
         est_re = np.full(num_ue, re_per_prb * max(num_prb // num_ue, 1), dtype=np.int32)
         mcs_indices = self.sionna_phy.select_mcs(
             num_allocated_re=est_re,
@@ -415,7 +466,6 @@ class SimulationEngine:
 
         # --- PF 调度 ---
         ue_buffer = np.array([ue.buffer_bytes for ue in self.ue_states])
-        # 重传 UE 也需要有 buffer (即使已传数据还没 ACK)
         for ue in retx_info:
             ue_buffer[ue] = max(ue_buffer[ue], retx_info[ue]['tbs'] // 8)
         sched = self.scheduler.schedule(
@@ -424,77 +474,78 @@ class SimulationEngine:
             mcs_indices, ue_rank
         )
         
-        # --- MU-MIMO 真实 SINR 计算 ---
-        # 如果调度器执行了 MU-MIMO，需要用实际信道计算真实 SINR (含估计误差影响)
-        if hasattr(self.scheduler, 'max_co_ue') and self.scheduler.max_co_ue > 1:
+        # --- L1 评估闭环: 计算 MU-MIMO 真实 SINR ---
+        if sched.mu_groups is not None:
             from ..scheduler.mu_mimo_scheduler import compute_mu_mimo_sinr
             from ..utils.math_utils import dbm_to_watt
             
             tx_pwr_prb = dbm_to_watt(self.cell_config.total_power_dbm) / num_prb
             noise_pwr_prb = (1.3806e-23 * 290 * self.carrier_config.subcarrier_spacing * 1e3 * 12 
                              * 10**(self.cell_config.noise_figure_db/10))
-                             
-            # 找到有共调度的 PRB
-            for prb in range(num_prb):
-                ue_list = []
-                # 假设通过某种方式获取共调度列表，这里简化从 prb_assignment 逻辑推断或记录
-                # 实际上应该从 sched 中获取更详细的 mu_mimo_groups
-                # 为了简化，我们假设逻辑已在 scheduler 中处理，这里只针对分配了 UE 的 PRB
-                ue_idx = sched.prb_assignment[prb]
-                if ue_idx >= 0:
-                    # 如果是 MU-MIMO 调度器，我们尝试恢复该 PRB 的所有 UE
-                    # 这里由于 SchedulingDecision 没存 mu_mimo_groups，我们假设是单 UE 或从 scheduler 缓存取
-                    # 完善做法是修改 SchedulingDecision。这里我们做一个保守更新。
-                    pass
             
-            # 修正: 直接调用一个批处理版本的 SINR 计算 (如果存在) 或遍历
-            # 实际上 sionna_phy.evaluate 会重新计算吗？不，它直接用 sinr_per_re。
-            # 所以我们必须在这里更新 channel_state.sinr_per_prb
+            # 物理层真实的 SINR 网格 (初始化为全 0)
+            actual_sinr_per_prb = np.zeros_like(channel_state.sinr_per_prb)
+
             for prb in range(num_prb):
-                # 临时从 scheduler 获取该 PRB 的配对列表 (需要调度器支持或此处重新判定)
-                # 简化逻辑: 如果是 MU 调度器，且该 PRB 分配了，重新算一下
-                ue_idx = sched.prb_assignment[prb]
-                if ue_idx >= 0:
-                    # 这是一个简化的演示：重新计算该 PRB 的 SINR
-                    # 实际中应从调度决策中带回配对信息
-                    paired = [ue_idx] # 简化
-                    if channel_state.actual_channel_matrix is not None:
-                        sinrs = compute_mu_mimo_sinr(
-                            channel_state.actual_channel_matrix,
-                            channel_state.estimated_channel_matrix,
-                            paired, prb, tx_pwr_prb, noise_pwr_prb
-                        )
-                        channel_state.sinr_per_prb[ue_idx, 0, prb] = sinrs[0]
+                paired = sched.mu_groups[prb]
+                if not paired:
+                    continue
+                
+                # 计算该组 UE 在当前 PRB 的后处理 SINR (IRC 接收机)
+                mu_sinrs = compute_mu_mimo_sinr(
+                    channel_state.actual_channel_matrix,
+                    channel_state.estimated_channel_matrix,
+                    paired, prb, tx_pwr_prb, noise_pwr_prb
+                )
+                
+                for i, ue_idx in enumerate(paired):
+                    actual_sinr_per_prb[ue_idx, 0, prb] = mu_sinrs[i]
+            
+            # 使用受干扰影响的真实 SINR
+            phy_sinr_input = actual_sinr_per_prb
+        else:
+            phy_sinr_input = channel_state.sinr_per_prb
 
         # --- PHY 评估 ---
         ue_num_re = sched.ue_num_prbs * re_per_prb
         phy_results = self.sionna_phy.evaluate(
             mcs_indices=mcs_indices,
-            sinr_per_re=channel_state.sinr_per_prb,
+            sinr_per_re=phy_sinr_input,
             num_allocated_re=ue_num_re.astype(np.int32),
             prb_assignment=sched.prb_assignment,
         )
 
-        # --- HARQ 反馈处理 ---
-        final_decoded_bits = phy_results['decoded_bits'].copy()
+        # --- HARQ: K1 延迟反馈 ---
+        # PHY 判定结果不立即处理, 排入 K1 延迟队列
+        # decoded_bits 在 TX slot 记为 0, 在 feedback 到达时通过 deliver 记录
+        final_decoded_bits = np.zeros(num_ue, dtype=np.int64)
+
+        # 加上本 slot K1 到期交付的 decoded bits
+        final_decoded_bits += self.harq_mgr.get_delivered_decoded_bits()
+
         for ue in range(num_ue):
             is_scheduled = sched.ue_num_prbs[ue] > 0
+            if not is_scheduled:
+                continue
+
             is_success = bool(phy_results['is_success'][ue])
             sinr_linear = float(phy_results['sinr_eff'][ue])
+            tbs = int(sched.ue_tbs_bits[ue])
+
+            # 计算 feedback 到达 slot
+            if self._is_tdd:
+                fb_slot = self.tdd.get_feedback_slot(slot_idx, self._harq_k1)
+            else:
+                fb_slot = slot_idx + self._harq_k1
 
             if ue in retx_info:
-                # 重传 UE: Chase Combining (累积 SINR)
+                # 重传: 排入 K1 队列
                 pid = retx_info[ue]['process_id']
-                combined_sinr = self.harq_mgr.get_combining_sinr(ue, pid, sinr_linear)
-                # 如果 combining 后 SINR 提升, 重新判定成功
-                # 简化: combining 增益 ~3dB → 成功率提升
-                if not is_success and combined_sinr > sinr_linear * 1.5:
-                    is_success = True  # combining 增益使重传成功
-                fb = self.harq_mgr.process_feedback(ue, pid, is_success, sinr_linear)
-                final_decoded_bits[ue] = fb['decoded_bits']
-            elif is_scheduled:
-                # 新传输: 注册 HARQ 进程
-                tbs = int(sched.ue_tbs_bits[ue])
+                self.harq_mgr.queue_feedback(
+                    fb_slot, ue, pid, is_success, sinr_linear, tbs
+                )
+            else:
+                # 新传输: 先注册 HARQ 进程, 再排入 K1 队列
                 if tbs > 0:
                     pid = self.harq_mgr.start_new_tx(
                         ue, int(mcs_indices[ue]), int(sched.ue_num_prbs[ue]),
@@ -502,12 +553,9 @@ class SimulationEngine:
                     )
                     if pid >= 0:
                         self._active_harq_pid[ue] = pid
-                        if not is_success:
-                            # NACK: 加入重传队列
-                            self.harq_mgr.process_feedback(ue, pid, False, sinr_linear)
-                            final_decoded_bits[ue] = 0
-                        else:
-                            self.harq_mgr.process_feedback(ue, pid, True, sinr_linear)
+                        self.harq_mgr.queue_feedback(
+                            fb_slot, ue, pid, is_success, sinr_linear, tbs
+                        )
 
         phy_results['decoded_bits'] = final_decoded_bits
 
@@ -628,6 +676,16 @@ class SimulationEngine:
             return PoissonTraffic(
                 packet_size_bytes=1500,
                 arrival_rate_pps=self.traffic_config.ftp_lambda * 1000,
+                slot_duration_s=self.carrier_config.slot_duration_s,
+                num_ue=self.num_ue,
+                rng=self.rng.traffic,
+            )
+        elif t == 'realistic':
+            from ..traffic.realistic_traffic import RealisticTraffic
+            return RealisticTraffic(
+                mean_arrival_rate_pps=self.traffic_config.realistic_arrival_rate_pps,
+                packet_size_mean_bytes=self.traffic_config.realistic_pkt_size_mean,
+                packet_size_std_bytes=self.traffic_config.realistic_pkt_size_std,
                 slot_duration_s=self.carrier_config.slot_duration_s,
                 num_ue=self.num_ue,
                 rng=self.rng.traffic,

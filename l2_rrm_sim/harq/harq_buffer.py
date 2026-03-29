@@ -1,18 +1,20 @@
 """HARQ 重传调度管理
 
-重传优先级:
-- HARQ 重传优先于新传输
-- 重传使用原始 MCS 和分配参数
+支持:
+- 重传优先于新传输
+- K1 反馈时延 (HARQ-ACK 在 tx_slot + K1 的 UL slot 到达)
+- TDD-aware: ACK 只能在 UL/Special slot 发送
 """
 
 import numpy as np
+from collections import defaultdict
 from .harq_entity import HARQEntity
 
 
 class HARQManager:
     """HARQ 管理器 (所有 UE)
 
-    协调各 UE 的 HARQ 实体，提供统一接口。
+    支持 K1 延迟反馈: 反馈不立即处理, 而是排队到 feedback_slot 才交付。
     """
 
     def __init__(self, num_ue: int,
@@ -24,6 +26,11 @@ class HARQManager:
             HARQEntity(num_processes, max_retx, combining_gain_db)
             for _ in range(num_ue)
         ]
+
+        # K1 延迟反馈队列: {delivery_slot: [(ue_id, pid, is_ack, sinr, tbs), ...]}
+        self._pending_feedback = defaultdict(list)
+        # 本 slot 交付的 decoded_bits (累积到 _finalize_slot)
+        self._delivered_decoded_bits = np.zeros(num_ue, dtype=np.int64)
 
     def has_any_retransmission(self) -> np.ndarray:
         """(num_ue,) bool: 各 UE 是否有待重传"""
@@ -78,6 +85,48 @@ class HARQManager:
         return self.entities[ue_id].get_combining_sinr(
             process_id, current_sinr
         )
+
+    def queue_feedback(self, delivery_slot: int, ue_id: int,
+                       process_id: int, is_ack: bool,
+                       sinr_eff_linear: float = 0.0,
+                       tbs_bits: int = 0):
+        """将反馈排入延迟队列 (K1 delay)
+
+        Args:
+            delivery_slot: 反馈到达的 slot
+            ue_id: UE ID
+            process_id: HARQ 进程 ID
+            is_ack: True=ACK
+            sinr_eff_linear: 有效 SINR
+            tbs_bits: TBS (ACK 时用于 decoded_bits)
+        """
+        self._pending_feedback[delivery_slot].append(
+            (ue_id, process_id, is_ack, sinr_eff_linear, tbs_bits)
+        )
+
+    def deliver_feedback(self, current_slot: int) -> list:
+        """交付到期的反馈 (每 slot 开头调用)
+
+        Returns:
+            delivered: [(ue_id, result_dict), ...]
+        """
+        self._delivered_decoded_bits[:] = 0
+        delivered = []
+
+        # 收集所有到期的反馈 (包括更早的, 以防 UL slot 间隔)
+        slots_to_deliver = [s for s in self._pending_feedback if s <= current_slot]
+        for slot in sorted(slots_to_deliver):
+            for (ue_id, pid, is_ack, sinr, tbs) in self._pending_feedback.pop(slot):
+                result = self.process_feedback(ue_id, pid, is_ack, sinr)
+                if is_ack:
+                    self._delivered_decoded_bits[ue_id] += tbs
+                delivered.append((ue_id, result))
+
+        return delivered
+
+    def get_delivered_decoded_bits(self) -> np.ndarray:
+        """获取本 slot 因 K1 到期而确认的 decoded bits"""
+        return self._delivered_decoded_bits.copy()
 
     def get_all_stats(self) -> dict:
         """获取所有 UE 的 HARQ 统计汇总"""

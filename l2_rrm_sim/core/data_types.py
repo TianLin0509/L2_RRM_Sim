@@ -12,6 +12,8 @@ class SlotContext:
     frame_idx: int = 0                 # 帧号
     subframe_idx: int = 0              # 子帧号
     slot_in_subframe: int = 0          # 子帧内 slot 号
+    slot_direction: str = 'D'          # TDD: 'D'=下行, 'U'=上行, 'S'=特殊
+    num_dl_symbols: int = 14           # 可用 DL OFDM 符号数
 
 
 @dataclass
@@ -43,13 +45,19 @@ class ChannelState:
 
 @dataclass
 class SchedulingDecision:
-    """调度决策"""
-    prb_assignment: np.ndarray         # (num_prb,) 每 PRB 分配给哪个 UE (-1=未分配)
+    """调度决策 (gNB 下发的调度指令集)"""
+    prb_assignment: np.ndarray         # (num_prb,) 主调度 UE ID (-1=未分配)
     ue_mcs: np.ndarray                 # (num_ue,) 每 UE 的 MCS index
     ue_rank: np.ndarray                # (num_ue,) 每 UE 的传输层数
     ue_num_prbs: np.ndarray            # (num_ue,) 每 UE 分配的 PRB 数
     ue_tbs_bits: np.ndarray            # (num_ue,) 每 UE 的 TBS [bits]
     ue_num_re: np.ndarray              # (num_ue,) 每 UE 的有效 RE 数
+    
+    # --- 扩展支持 MU-MIMO 和 HARQ ---
+    mu_groups: list = None             # 长度为 num_prb 的列表，每个元素是该 PRB 配对的 UE ID 列表
+    precoders: list = None             # 长度为 num_prb 的列表，每个元素是 (tx_ports, num_paired_ue) 的预编码矩阵
+    ue_harq_pid: np.ndarray = None     # (num_ue,) 选定的 HARQ 进程 ID
+    ue_rv: np.ndarray = None           # (num_ue,) 选定的冗余版本 (RV 0,2,3,1)
 
 
 @dataclass

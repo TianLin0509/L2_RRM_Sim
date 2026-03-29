@@ -141,6 +141,7 @@ class MUMIMOPFScheduler(SchedulerBase):
             ue_num_prbs=ue_num_prbs,
             ue_tbs_bits=ue_tbs,
             ue_num_re=ue_num_re,
+            mu_groups=mu_groups,  # 关键：传出配对组信息
         )
 
     def _mu_mimo_schedule(self, pf_metric, has_data, h_est,
@@ -243,44 +244,54 @@ def compute_mu_mimo_sinr(h_actual: np.ndarray,
                          prb_idx: int,
                          tx_power_per_prb: float,
                          noise_power: float) -> np.ndarray:
-    """计算 MU-MIMO ZF 后各 UE 的真实 SINR
+    """计算 MU-MIMO ZF 后各 UE 的真实 SINR (使用 MMSE-IRC 接收机)
 
+    MMSE-IRC 能够利用多天线空间特性抑制配对 UE 间的残余干扰。
+    
     Args:
-        h_actual: 真实信道 (Ground Truth)
-        h_est: 估计信道 (用于预编码设计)
-        paired_ues: 配对 UE
+        h_actual: 真实信道 (Ground Truth), (num_ue, rx_ant, tx_ports, num_prb)
+        h_est: 估计信道 (gNB 侧用于预编码设计)
+        paired_ues: 当前 PRB 配对的 UE ID 列表
         prb_idx: PRB 索引
-        tx_power_per_prb: 总发射功率 (该 PRB)
-        noise_power: 噪声功率
+        tx_power_per_prb: 该 PRB 总发射功率
+        noise_power: 接收端高斯噪声功率
     """
-    # 预编码矩阵设计基于估计信道
+    # 预编码设计基于 gNB 侧的估计信道
     W = compute_zf_precoder(h_est, paired_ues, prb_idx)
     num_paired = len(paired_ues)
+    num_rx_ant = h_actual.shape[1]
     sinr = np.zeros(num_paired)
 
     # 假设各流功率均分
     power_per_ue = tx_power_per_prb / num_paired
 
-    for i, ue in enumerate(paired_ues):
-        # 接收端使用实际信道 (Ground Truth)
-        # 且假设 UE 能够利用所有接收天线进行 MRC (最大比合并)
-        h_ue_actual = h_actual[ue, :, :, prb_idx] # (rx_ant, tx_ports)
+    for i, ue_id in enumerate(paired_ues):
+        # UE 看到的实际信道 H: (rx_ant, tx_ports)
+        H = h_actual[ue_id, :, :, prb_idx]
         
-        # UE 端组合向量 u (MRC): 对准自己的流
-        # u = (H_actual * W_i)^H
-        eff_h_i = h_ue_actual @ W[:, i] # (rx_ant,)
-        u = eff_h_i.conj() / (np.linalg.norm(eff_h_i) + 1e-10)
+        # 有效信道向量 h_eff_i = H * W_i: (rx_ant,)
+        h_eff_target = H @ W[:, i]
         
-        # 有效信号功率
-        signal = np.abs(np.dot(u, eff_h_i)) ** 2 * power_per_ue
+        # 构建干扰+噪声协方差矩阵 R_in (K_rx x K_rx)
+        # R_in = sum_{j != i} (H * W_j) * (H * W_j)^H * P + sigma^2 * I
+        R_in = noise_power * np.eye(num_rx_ant, dtype=complex)
         
-        # 干扰功率 (来自其他流)
-        interference = 0.0
         for j in range(num_paired):
             if j != i:
-                eff_h_j = h_ue_actual @ W[:, j]
-                interference += np.abs(np.dot(u, eff_h_j)) ** 2 * power_per_ue
+                h_eff_interf = H @ W[:, j] # (rx_ant,)
+                # 外积得到干扰协方差
+                R_in += power_per_ue * np.outer(h_eff_interf, h_eff_interf.conj())
         
-        sinr[i] = signal / (interference + noise_power)
+        # MMSE-IRC SINR 公式: SINR = P * h_eff^H * R_in^-1 * h_eff
+        try:
+            # 这里的 R_in 必须是正定的 (由于包含 noise_power * I，通常是可逆的)
+            R_in_inv = np.linalg.inv(R_in)
+            # 计算后处理 SINR
+            # sinr = P * (h^H @ R_inv @ h)
+            val = power_per_ue * (h_eff_target.conj().T @ R_in_inv @ h_eff_target)
+            sinr[i] = np.abs(val)
+        except np.linalg.LinAlgError:
+            # 回退到 MRC 如果矩阵奇异
+            sinr[i] = power_per_ue * np.abs(np.dot(h_eff_target.conj(), h_eff_target)) / (noise_power + 1e-10)
 
     return sinr

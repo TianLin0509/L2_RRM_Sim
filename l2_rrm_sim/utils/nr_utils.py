@@ -38,13 +38,18 @@ def compute_num_re_per_prb(num_pdcch_symbols: int = 2,
                            dmrs_type: int = 1,
                            num_dmrs_cdm_groups: int = 2,
                            num_dmrs_symbols: int = 1,
-                           overhead: int = 0) -> int:
+                           overhead: int = 0,
+                           num_dl_symbols: int = None) -> int:
     """计算每 PRB 可用 RE 数 (TS 38.214 Section 5.1.3.2)
 
     N_RE' = N_sc_RB × N_symb_sh - N_DMRS_PRB - N_oh_PRB
     N_RE = min(156, N_RE')
+
+    Args:
+        num_dl_symbols: 可用 DL 符号数 (TDD Special slot 时 < 14)
     """
-    n_symb_sh = NUM_SYMBOLS_PER_SLOT - num_pdcch_symbols
+    total_symbols = num_dl_symbols if num_dl_symbols is not None else NUM_SYMBOLS_PER_SLOT
+    n_symb_sh = total_symbols - min(num_pdcch_symbols, total_symbols)
 
     # DMRS overhead per PRB
     if dmrs_type == 1:

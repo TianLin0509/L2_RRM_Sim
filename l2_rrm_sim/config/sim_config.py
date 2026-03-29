@@ -85,9 +85,24 @@ class LinkAdaptationConfig:
 @dataclass
 class TrafficConfig:
     """流量模型配置"""
-    type: str = "full_buffer"          # 流量类型
+    type: str = "full_buffer"          # 流量类型 (full_buffer/ftp_model3/poisson/realistic)
     ftp_file_size_bytes: int = 512000  # FTP 文件大小 (bytes)
     ftp_lambda: float = 0.5            # FTP 到达率 (files/s)
+    # Realistic 流量参数
+    realistic_arrival_rate_pps: float = 50.0    # 包到达率 (pkt/s/UE)
+    realistic_pkt_size_mean: float = 1500.0     # 包大小均值 (bytes)
+    realistic_pkt_size_std: float = 500.0       # 包大小标准差 (bytes)
+
+
+@dataclass
+class TDDConfig:
+    """TDD 配置"""
+    duplex_mode: str = "TDD"            # "FDD" 或 "TDD"
+    pattern: str = "DDDSU"             # TDD 时隙模式
+    special_dl_symbols: int = 10       # Special slot DL 符号数
+    special_gp_symbols: int = 2        # GP 符号数
+    special_ul_symbols: int = 2        # UL 符号数
+    harq_k1: int = 4                   # HARQ K1 最小值 (slots)
 
 
 @dataclass
@@ -123,5 +138,6 @@ def load_config(yaml_path: str) -> dict:
         'traffic': TrafficConfig(**raw.get('traffic', {})),
         'channel': ChannelConfig(**raw.get('channel', {})),
         'csi': CSIConfig(**raw.get('csi', {})),
+        'tdd': TDDConfig(**raw.get('tdd', {})),
     }
     return config

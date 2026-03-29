@@ -240,7 +240,8 @@ class SimulationEngine:
 
         for slot_idx in range(num_slots):
             slot_result = self.run_slot(slot_idx)
-            self.kpi.collect(slot_idx, slot_result, self._buf_after_traffic)
+            buf_after = np.array([ue.buffer_bytes for ue in self.ue_states], dtype=np.int64)
+            self.kpi.collect(slot_idx, slot_result, self._buf_after_traffic, buf_after)
 
             if (slot_idx + 1) % 1000 == 0 or slot_idx == num_slots - 1:
                 elapsed = time.time() - t_start

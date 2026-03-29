@@ -26,16 +26,19 @@ class KPICollector:
         self.ue_tb_success = np.zeros((num_slots, num_ue), dtype=bool)
         self.ue_num_prbs = np.zeros((num_slots, num_ue), dtype=np.int32)
         self.ue_buffer_bytes = np.zeros((num_slots, num_ue), dtype=np.int64)
+        self.ue_buffer_after = np.zeros((num_slots, num_ue), dtype=np.int64)
         self.cell_throughput_bits = np.zeros(num_slots, dtype=np.float64)
 
         self._collected_slots = 0
 
     def collect(self, slot_idx: int, result: SlotResult,
-                ue_buffer_bytes: np.ndarray = None):
+                ue_buffer_bytes: np.ndarray = None,
+                ue_buffer_after: np.ndarray = None):
         """收集单 slot 数据
 
         Args:
-            ue_buffer_bytes: (num_ue,) 本 slot 流量生成后、调度前的 buffer 状态
+            ue_buffer_bytes: (num_ue,) 流量生成后、调度前的 buffer
+            ue_buffer_after: (num_ue,) 传输后的 buffer (可选, 用于精确体验速率)
         """
         self.ue_throughput_bits[slot_idx] = result.ue_decoded_bits
         self.ue_throughput_inst[slot_idx] = result.ue_throughput_inst
@@ -48,6 +51,8 @@ class KPICollector:
             self.ue_num_prbs[slot_idx] = result.scheduling_decision.ue_num_prbs
         if ue_buffer_bytes is not None:
             self.ue_buffer_bytes[slot_idx] = ue_buffer_bytes
+        if ue_buffer_after is not None:
+            self.ue_buffer_after[slot_idx] = ue_buffer_after
         self.cell_throughput_bits[slot_idx] = np.sum(result.ue_decoded_bits)
         self._collected_slots = slot_idx + 1
 

@@ -64,13 +64,19 @@ class KPIReporter:
         bits_data = c.ue_throughput_bits[s]
         prbs_data = c.ue_num_prbs[s]
 
+        buf_after_data = c.ue_buffer_after[s]  # 传输后 buffer
+        has_buf_after = np.any(buf_after_data != 0) or np.any(buf_data == 0)
+
         for t_idx in range(num_valid):
             slot_abs = s.start + t_idx
             buf_before = buf_data[t_idx]
             decoded = bits_data[t_idx]
             num_prbs_t = prbs_data[t_idx]
-            # buffer after = buffer before - decoded bytes (近似)
-            buf_after = np.maximum(buf_before - decoded // 8, 0)
+            # 使用精确的传输后 buffer (如果有), 否则近似
+            if has_buf_after and np.any(buf_after_data[t_idx] >= 0):
+                buf_after = buf_after_data[t_idx]
+            else:
+                buf_after = np.maximum(buf_before - decoded // 8, 0)
             exp_calc.process_slot(slot_abs, buf_before, decoded, num_prbs_t, buf_after)
 
         exp_result = exp_calc.compute_experienced_rate()

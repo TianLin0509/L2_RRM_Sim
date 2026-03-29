@@ -162,16 +162,30 @@ def run_simulation(config):
             num_ue=engine.num_ue, rng=engine.rng.traffic,
         )
 
+    # 是否使用 FTP (需要额外跟踪文件完成)
+    ftp_traffic = None
+    if traffic_type == "FTP Model 3" and hasattr(engine.traffic, 'dequeue_bytes'):
+        ftp_traffic = engine.traffic
+
     # 运行带进度
     total = config['sim'].num_slots
     progress_bar = st.progress(0, text="仿真中...")
-    status_text = st.empty()
     t0 = time.time()
 
     for slot_idx in range(total):
         slot_result = engine.run_slot(slot_idx)
-        buf = np.array([ue.buffer_bytes for ue in engine.ue_states], dtype=np.int64)
-        engine.kpi.collect(slot_idx, slot_result, buf)
+        buf_before = engine._buf_after_traffic.copy()
+
+        # FTP: 跟踪文件完成 (dequeue)
+        if ftp_traffic is not None:
+            for ue_idx in range(engine.num_ue):
+                decoded_bytes = int(slot_result.ue_decoded_bits[ue_idx]) // 8
+                if decoded_bytes > 0:
+                    ftp_traffic.dequeue_bytes(ue_idx, decoded_bytes, slot_idx)
+
+        # 记录传输后的 buffer 状态
+        buf_after = np.array([ue.buffer_bytes for ue in engine.ue_states], dtype=np.int64)
+        engine.kpi.collect(slot_idx, slot_result, buf_before, buf_after)
 
         if (slot_idx + 1) % max(total // 100, 1) == 0 or slot_idx == total - 1:
             pct = (slot_idx + 1) / total

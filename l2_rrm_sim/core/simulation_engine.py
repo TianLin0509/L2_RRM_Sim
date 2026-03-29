@@ -62,19 +62,27 @@ class SimulationEngine:
         self.ue_states = self._init_ue_states()
         self.num_ue = len(self.ue_states)
 
-        # 信道
-        self.channel = StatisticalChannel(
-            self.cell_config, self.carrier_config,
-            self.channel_config, self.rng.channel
-        )
+        # 信道 (支持 sionna/statistical 两种模式)
+        channel_type = self.channel_config.type.lower()
+        if channel_type == 'sionna':
+            from ..channel.sionna_channel import SionnaChannel
+            self.channel = SionnaChannel(
+                self.cell_config, self.carrier_config, self.channel_config
+            )
+        else:
+            self.channel = StatisticalChannel(
+                self.cell_config, self.carrier_config,
+                self.channel_config, self.rng.channel
+            )
         self.channel.initialize(
             self.cell_config, self.carrier_config, self.ue_states
         )
 
-        # Rank 自适应 (Phase 1: 固定 rank=1)
+        # Rank 自适应
+        use_fixed_rank = (channel_type != 'sionna')
         self.rank_adapter = RankAdapter(
             max_rank=self.cell_config.max_layers,
-            fixed_rank=1
+            fixed_rank=1 if use_fixed_rank else None,
         )
 
         # 链路自适应

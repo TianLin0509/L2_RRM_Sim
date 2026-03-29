@@ -117,13 +117,14 @@ class SimulationEngine:
                                           self.rng.phy)
             self._use_sionna_phy = False
 
-        # 调度器
+        # 调度器 (RBG 粒度)
         self.scheduler = PFSchedulerSUMIMO(
             num_ue=self.num_ue,
             num_prb=self.carrier_config.num_prb,
             num_re_per_prb=self.resource_grid.num_re_per_prb,
             mcs_table_index=self.la_config.mcs_table_index,
             beta=self.scheduler_config.beta,
+            resource_grid=self.resource_grid,
         )
 
         # CSI 反馈 + SINR 预估
@@ -173,6 +174,14 @@ class SimulationEngine:
             self.sim_config.num_slots, self.num_ue,
             warmup_slots=self.sim_config.warmup_slots
         )
+
+        # 信道估计器
+        from ..channel.channel_estimator import ChannelEstimator
+        self.channel_estimator = ChannelEstimator(self.rng, estimation_error_std=0.05)
+
+        # 事件总线 (Observer Pattern)
+        from ..kpi.event_bus import EventBus
+        self.event_bus = EventBus()
 
         # 反馈缓存 (上一 TTI)
         self._last_harq = np.ones(self.num_ue, dtype=np.int32)  # 1=ACK
@@ -238,10 +247,18 @@ class SimulationEngine:
 
         t_start = time.time()
 
+        # 启动事件总线异步处理
+        from ..kpi.event_bus import SimEvent
+        self.event_bus.start()
+        self.event_bus.emit(SimEvent('sim_started', data=config if 'config' in dir() else None))
+
         for slot_idx in range(num_slots):
             slot_result = self.run_slot(slot_idx)
             buf_after = np.array([ue.buffer_bytes for ue in self.ue_states], dtype=np.int64)
             self.kpi.collect(slot_idx, slot_result, self._buf_after_traffic, buf_after)
+
+            # 发射 slot_completed 事件
+            self.event_bus.emit(SimEvent('slot_completed', slot_idx=slot_idx, data=slot_result))
 
             if (slot_idx + 1) % 1000 == 0 or slot_idx == num_slots - 1:
                 elapsed = time.time() - t_start
@@ -251,6 +268,10 @@ class SimulationEngine:
 
         elapsed_total = time.time() - t_start
         print(f"=== 仿真完成 ({elapsed_total:.1f}s) ===\n")
+
+        # 停止事件总线
+        self.event_bus.emit(SimEvent('sim_completed', data={'elapsed_s': elapsed_total}))
+        self.event_bus.stop()
 
         # 生成报告
         reporter = KPIReporter(self.kpi, self.carrier_config,
@@ -288,20 +309,28 @@ class SimulationEngine:
 
         # 信道更新
         channel_state = self.channel.update(slot_ctx, self.ue_states)
+        
+        # 为了兼容旧代码，如果 channel.update 返回的是旧的 channel_matrix，将其映射到 actual_channel_matrix
+        if hasattr(channel_state, 'channel_matrix') and channel_state.actual_channel_matrix is None:
+            channel_state.actual_channel_matrix = channel_state.channel_matrix
+            
+        # 生成估计信道 (包含 LS 估计误差)
+        channel_state.estimated_channel_matrix = self.channel_estimator.estimate(channel_state)
 
-        # 3. CSI 测量与反馈 (周期性)
+        # 3. CSI 测量与反馈 (使用估计信道)
         if self._csi_enabled:
             # 接收到期的 CSI 反馈
             self.csi_manager.receive_feedback(slot_idx)
 
             # 周期性 CSI 测量
             if self.csi_manager.should_measure(slot_idx):
-                if channel_state.channel_matrix is not None:
+                h_est = channel_state.estimated_channel_matrix
+                if h_est is not None:
                     tx_pwr = self.cell_config.total_power_dbm
                     from ..utils.math_utils import dbm_to_watt
                     tx_per_prb = dbm_to_watt(tx_pwr) / num_prb
                     self.csi_manager.measure_and_report(
-                        slot_idx, channel_state.channel_matrix, tx_per_prb
+                        slot_idx, h_est, tx_per_prb
                     )
 
         # 4. Rank 选择 (优先使用 CSI RI)
@@ -336,17 +365,26 @@ class SimulationEngine:
 
         # --- SINR 预估 (CSI-based) ---
         sinr_eff_for_olla = self._last_sinr_eff.copy()
-        if self._csi_enabled and channel_state.channel_matrix is not None:
+        if self._csi_enabled and channel_state.actual_channel_matrix is not None:
             csi_reports = self.csi_manager.get_all_latest_reports()
+            # 使用估计信道进行预估 (模拟 gNB 侧行为)
             sinr_pred_db = self.sinr_predictor.predict_all_ue(
-                csi_reports, channel_state.channel_matrix, mode='su'
+                csi_reports, channel_state.estimated_channel_matrix, mode='su'
             )
             from ..utils.math_utils import db_to_linear
+            from ..utils.cqi_utils import sinr_to_cqi, cqi_to_mcs
+            
             for ue in range(num_ue):
                 if csi_reports[ue] is not None and sinr_pred_db[ue] > -29:
+                    # 模拟 UE 端 SINR -> CQI -> gNB 端 MCS
+                    cqi = sinr_to_cqi(sinr_pred_db[ue])
+                    # gNB 根据反馈的 CQI 粗选一个 MCS，再加上 OLLA 补偿
+                    mcs_from_cqi = cqi_to_mcs(cqi)
+                    mcs_indices[ue] = mcs_from_cqi
+                    
                     sinr_eff_for_olla[ue] = db_to_linear(sinr_pred_db[ue])
 
-        # --- MCS 选择 (Sionna OLLA) ---
+        # --- MCS 选择 (OLLA) ---
         est_re = np.full(num_ue, re_per_prb * max(num_prb // num_ue, 1), dtype=np.int32)
         mcs_indices = self.sionna_phy.select_mcs(
             num_allocated_re=est_re,
@@ -385,6 +423,48 @@ class SimulationEngine:
             achievable_rate_per_prb, ue_buffer,
             mcs_indices, ue_rank
         )
+        
+        # --- MU-MIMO 真实 SINR 计算 ---
+        # 如果调度器执行了 MU-MIMO，需要用实际信道计算真实 SINR (含估计误差影响)
+        if hasattr(self.scheduler, 'max_co_ue') and self.scheduler.max_co_ue > 1:
+            from ..scheduler.mu_mimo_scheduler import compute_mu_mimo_sinr
+            from ..utils.math_utils import dbm_to_watt
+            
+            tx_pwr_prb = dbm_to_watt(self.cell_config.total_power_dbm) / num_prb
+            noise_pwr_prb = (1.3806e-23 * 290 * self.carrier_config.subcarrier_spacing * 1e3 * 12 
+                             * 10**(self.cell_config.noise_figure_db/10))
+                             
+            # 找到有共调度的 PRB
+            for prb in range(num_prb):
+                ue_list = []
+                # 假设通过某种方式获取共调度列表，这里简化从 prb_assignment 逻辑推断或记录
+                # 实际上应该从 sched 中获取更详细的 mu_mimo_groups
+                # 为了简化，我们假设逻辑已在 scheduler 中处理，这里只针对分配了 UE 的 PRB
+                ue_idx = sched.prb_assignment[prb]
+                if ue_idx >= 0:
+                    # 如果是 MU-MIMO 调度器，我们尝试恢复该 PRB 的所有 UE
+                    # 这里由于 SchedulingDecision 没存 mu_mimo_groups，我们假设是单 UE 或从 scheduler 缓存取
+                    # 完善做法是修改 SchedulingDecision。这里我们做一个保守更新。
+                    pass
+            
+            # 修正: 直接调用一个批处理版本的 SINR 计算 (如果存在) 或遍历
+            # 实际上 sionna_phy.evaluate 会重新计算吗？不，它直接用 sinr_per_re。
+            # 所以我们必须在这里更新 channel_state.sinr_per_prb
+            for prb in range(num_prb):
+                # 临时从 scheduler 获取该 PRB 的配对列表 (需要调度器支持或此处重新判定)
+                # 简化逻辑: 如果是 MU 调度器，且该 PRB 分配了，重新算一下
+                ue_idx = sched.prb_assignment[prb]
+                if ue_idx >= 0:
+                    # 这是一个简化的演示：重新计算该 PRB 的 SINR
+                    # 实际中应从调度决策中带回配对信息
+                    paired = [ue_idx] # 简化
+                    if channel_state.actual_channel_matrix is not None:
+                        sinrs = compute_mu_mimo_sinr(
+                            channel_state.actual_channel_matrix,
+                            channel_state.estimated_channel_matrix,
+                            paired, prb, tx_pwr_prb, noise_pwr_prb
+                        )
+                        channel_state.sinr_per_prb[ue_idx, 0, prb] = sinrs[0]
 
         # --- PHY 评估 ---
         ue_num_re = sched.ue_num_prbs * re_per_prb

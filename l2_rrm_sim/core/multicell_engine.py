@@ -184,16 +184,23 @@ class MultiCellSimulationEngine:
         self._precompute_interference()
 
     def _precompute_interference(self):
-        """预计算每个 UE 的小区间干扰"""
+        """预计算路径损耗缓存 + 静态干扰 (第一次)"""
+        self.ici.precompute_pathloss(
+            self.cell_ue_states, self.topology, self.topology.cell_positions
+        )
+        # 静态干扰 (回退用)
         self._ue_interference = {}
         for cell_idx in range(self.num_cells):
-            for ue_idx, ue in enumerate(self.cell_ue_states[cell_idx]):
-                intf = self.ici.compute_interference(
-                    ue.position, cell_idx,
-                    self.topology.cell_positions,
-                    self.topology
+            for ue_idx in range(len(self.cell_ue_states[cell_idx])):
+                ue_key = (cell_idx, ue_idx)
+                self._ue_interference[ue_key] = self.ici.compute_static_interference(
+                    ue_key, cell_idx
                 )
-                self._ue_interference[(cell_idx, ue_idx)] = np.mean(intf)
+        # 上一 slot 各小区的 PRB 负载 (动态干扰用)
+        self._cell_prb_loads = {
+            c: np.full(self.carrier_config.num_prb, self.ici.load_factor)
+            for c in range(self.num_cells)
+        }
 
     def run(self) -> dict:
         """运行多小区仿真"""
@@ -256,8 +263,14 @@ class MultiCellSimulationEngine:
                             ue.position[2], self.carrier_config.carrier_freq_ghz, is_los)
             pl_linear = db_to_linear(pl_db)
             fading = self.rng.channel.exponential(1.0, (self.cell_config.max_layers, num_prb))
-            intf = self._ue_interference.get((cell_idx, ue_idx), 0.0)
-            sinr_per_prb[ue_idx] = tx_power_per_prb * fading / (pl_linear * (noise_power + intf))
+            # 动态干扰: 基于上一 slot 各邻小区的 PRB 调度负载
+            ue_key = (cell_idx, ue_idx)
+            intf_per_prb = self.ici.compute_dynamic_interference(
+                ue_key, cell_idx, self._cell_prb_loads
+            )
+            sinr_per_prb[ue_idx] = (
+                tx_power_per_prb * fading / (pl_linear * (noise_power + intf_per_prb[np.newaxis, :]))
+            )
 
         ue_rank = np.ones(num_ue, dtype=np.int32)
 
@@ -317,6 +330,11 @@ class MultiCellSimulationEngine:
                 phy_results['is_success'], 1, 0).astype(np.int32)
         self._cell_last_scheduled[cell_idx] = sched.ue_num_prbs > 0
         scheduler.update_throughput_history(phy_results['decoded_bits'].astype(float))
+
+        # 更新本小区 PRB 负载 (供下一 slot 其他小区的干扰计算)
+        prb_load = np.zeros(num_prb)
+        prb_load[sched.prb_assignment >= 0] = 1.0
+        self._cell_prb_loads[cell_idx] = prb_load
 
         for ue_idx, ue in enumerate(ue_states):
             tx_bytes = int(phy_results['decoded_bits'][ue_idx]) // 8

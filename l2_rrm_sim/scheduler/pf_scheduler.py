@@ -1,7 +1,8 @@
 """Proportional Fair (PF) 调度器 — SU-MIMO
 
-PF metric: R_achievable[ue, prb] / T_avg[ue]
-每 PRB 分配给 metric 最大的 UE。
+调度粒度: RBG (Resource Block Group), 符合 TS 38.214
+PF metric: R_achievable[ue, rbg] / T_avg[ue]
+每 RBG 分配给 metric 最大的 UE。
 只调度有数据的 UE (buffer-aware)。
 """
 
@@ -14,22 +15,35 @@ from ..utils.nr_utils import compute_tbs
 
 
 class PFSchedulerSUMIMO(SchedulerBase):
-    """SU-MIMO Proportional Fair 调度器
+    """SU-MIMO Proportional Fair 调度器 (RBG 粒度)
 
-    T_avg[ue] = β × T_avg[ue] + (1-β) × R_last[ue]
+    T_avg[ue] = beta × T_avg[ue] + (1-beta) × R_last[ue]
+    调度以 RBG 为单位分配, 展开为 PRB 级结果。
     """
 
     def __init__(self, num_ue: int, num_prb: int,
                  num_re_per_prb: int = 132,
                  mcs_table_index: int = 1,
-                 beta: float = 0.98):
+                 beta: float = 0.98,
+                 resource_grid=None):
         self.num_ue = num_ue
         self.num_prb = num_prb
         self.num_re_per_prb = num_re_per_prb
         self.mcs_table_index = mcs_table_index
         self.beta = beta
+        self._resource_grid = resource_grid
 
-        # 时间平均吞吐量 (初始化为 1 避免除零)
+        # RBG 参数
+        if resource_grid is not None:
+            self.rbg_size = resource_grid.rbg_size
+            self.num_rbg = resource_grid.num_rbg
+        else:
+            # 回退: 16 PRB per RBG (100MHz@30kHz 默认)
+            from ..core.resource_grid import get_rbg_size
+            self.rbg_size = get_rbg_size(num_prb)
+            self.num_rbg = (num_prb + self.rbg_size - 1) // self.rbg_size
+
+        # 时间平均吞吐量
         self._t_avg = np.ones(num_ue, dtype=np.float64)
 
     @property
@@ -43,33 +57,41 @@ class PFSchedulerSUMIMO(SchedulerBase):
                  ue_buffer_bytes: np.ndarray,
                  ue_mcs: np.ndarray,
                  ue_rank: np.ndarray) -> SchedulingDecision:
-        """PF 调度"""
+        """PF 调度 (RBG 粒度)"""
         num_ue = self.num_ue
         num_prb = self.num_prb
 
-        # 只调度有数据的 UE
-        has_data = ue_buffer_bytes > 0  # (num_ue,)
+        has_data = ue_buffer_bytes > 0
 
-        # PF metric: (num_ue, num_prb)
-        pf_metric = np.zeros((num_ue, num_prb))
+        # 将 per-PRB achievable rate 聚合到 per-RBG
+        if self._resource_grid is not None:
+            rate_per_rbg = self._resource_grid.aggregate_prb_to_rbg(achievable_rate_per_prb)
+        else:
+            rate_per_rbg = self._aggregate_to_rbg(achievable_rate_per_prb)
+
+        # PF metric per RBG: (num_ue, num_rbg)
+        pf_metric = np.zeros((num_ue, self.num_rbg))
         for ue in range(num_ue):
             if has_data[ue]:
-                pf_metric[ue, :] = (
-                    achievable_rate_per_prb[ue, :] / max(self._t_avg[ue], 1e-10)
-                )
+                pf_metric[ue, :] = rate_per_rbg[ue, :] / max(self._t_avg[ue], 1e-10)
 
-        # 每 PRB 分配给 metric 最大的 UE
-        prb_assignment = np.argmax(pf_metric, axis=0)  # (num_prb,)
-
-        # 如果某 PRB 上所有 metric 为 0，标记为 -1
+        # 每 RBG 分配给 metric 最大的 UE
+        rbg_assignment = np.argmax(pf_metric, axis=0)  # (num_rbg,)
         max_metric = np.max(pf_metric, axis=0)
-        prb_assignment = prb_assignment.astype(np.int32)
-        prb_assignment[max_metric <= 0] = -1
+        rbg_assignment = rbg_assignment.astype(np.int32)
+        rbg_assignment[max_metric <= 0] = -1
+
+        # 展开 RBG → PRB
+        if self._resource_grid is not None:
+            prb_assignment = self._resource_grid.expand_rbg_to_prb(rbg_assignment)
+        else:
+            prb_assignment = self._expand_to_prb(rbg_assignment)
 
         # 统计每 UE 分配的 PRB 数
-        ue_num_prbs = np.zeros(num_ue, dtype=np.int32)
-        for ue in range(num_ue):
-            ue_num_prbs[ue] = np.sum(prb_assignment == ue)
+        ue_num_prbs = np.bincount(
+            prb_assignment[prb_assignment >= 0],
+            minlength=num_ue
+        ).astype(np.int32)[:num_ue]
 
         # 计算 TBS 和 RE 数
         ue_tbs = np.zeros(num_ue, dtype=np.int64)
@@ -92,11 +114,28 @@ class PFSchedulerSUMIMO(SchedulerBase):
             ue_num_re=ue_num_re,
         )
 
+    def _aggregate_to_rbg(self, per_prb: np.ndarray) -> np.ndarray:
+        """回退: 无 resource_grid 时手动聚合"""
+        result = np.zeros((per_prb.shape[0], self.num_rbg))
+        for rbg in range(self.num_rbg):
+            s = rbg * self.rbg_size
+            e = min(s + self.rbg_size, self.num_prb)
+            result[:, rbg] = np.mean(per_prb[:, s:e], axis=1)
+        return result
+
+    def _expand_to_prb(self, rbg_assignment: np.ndarray) -> np.ndarray:
+        """回退: 无 resource_grid 时手动展开"""
+        prb_assignment = np.full(self.num_prb, -1, dtype=np.int32)
+        for rbg in range(self.num_rbg):
+            s = rbg * self.rbg_size
+            e = min(s + self.rbg_size, self.num_prb)
+            prb_assignment[s:e] = rbg_assignment[rbg]
+        return prb_assignment
+
     def update_throughput_history(self, ue_throughput_bits: np.ndarray):
         """更新 PF 时间平均吞吐量"""
         self._t_avg = (
             self.beta * self._t_avg
             + (1.0 - self.beta) * ue_throughput_bits
         )
-        # 防止退化到 0
         self._t_avg = np.maximum(self._t_avg, 1e-10)

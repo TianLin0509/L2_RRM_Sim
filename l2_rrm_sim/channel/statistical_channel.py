@@ -94,28 +94,38 @@ class StatisticalChannel(ChannelModelBase):
         num_ue = len(ue_states)
         num_prb = self.carrier_config.num_prb
         max_layers = self.cell_config.max_layers
+        num_tx_ant = self.cell_config.num_tx_ant
+        num_rx_ant = getattr(self.cell_config, 'num_rx_ant', 4) # 默认 4
+        if hasattr(ue_states[0], 'num_rx_ant'):
+            num_rx_ant = ue_states[0].num_rx_ant
 
-        # 快衰落: Rayleigh → |H|² ~ Exp(1)
-        # shape: (num_ue, max_layers, num_prb)
-        fading_gain = self._rng.exponential(1.0, (num_ue, max_layers, num_prb))
+        # 生成复高斯信道矩阵 H ~ CN(0, 1)
+        # shape: (num_ue, num_rx_ant, num_tx_ant, num_prb)
+        h_real = self._rng.normal(0, 1/np.sqrt(2), (num_ue, num_rx_ant, num_tx_ant, num_prb))
+        h_imag = self._rng.normal(0, 1/np.sqrt(2), (num_ue, num_rx_ant, num_tx_ant, num_prb))
+        h_matrix = h_real + 1j * h_imag
 
         # SINR 计算
         sinr_per_prb = np.zeros((num_ue, max_layers, num_prb))
         wideband_sinr_db = np.zeros(num_ue)
+        actual_channel_matrix = np.zeros_like(h_matrix, dtype=complex)
 
         for ue in range(num_ue):
-            # 总路径损耗 (linear)
             total_loss_db = self._pathloss_db[ue] + self._shadow_fading_db[ue]
             total_loss_linear = db_to_linear(total_loss_db)
+            
+            # 将路径损耗应用到信道矩阵
+            # H_actual = H_gaussian / sqrt(PL)
+            actual_channel_matrix[ue] = h_matrix[ue] / np.sqrt(total_loss_linear)
 
-            # per-PRB per-layer SINR (linear)
-            # SINR = P_tx_per_prb × gain / (loss × noise)
-            sinr_per_prb[ue] = (
-                self._tx_power_per_prb * fading_gain[ue]
+            # 计算 SU-MIMO SINR (作为参考值)
+            # 简化: SINR = P_tx_per_prb * |h|^2 / (PL * N0)
+            fading_gain = np.abs(h_matrix[ue, 0, 0, :])**2 # 取第一对天线作为参考
+            sinr_per_prb[ue, 0, :] = (
+                self._tx_power_per_prb * fading_gain
                 / (total_loss_linear * self._noise_power_per_prb)
             )
 
-            # 宽带 SINR (所有 PRB 的平均, layer 0)
             wideband_sinr_db[ue] = linear_to_db(np.mean(sinr_per_prb[ue, 0, :]))
 
         return ChannelState(
@@ -123,5 +133,5 @@ class StatisticalChannel(ChannelModelBase):
             shadow_fading_db=self._shadow_fading_db.copy(),
             sinr_per_prb=sinr_per_prb,
             wideband_sinr_db=wideband_sinr_db,
-            channel_matrix=None
+            actual_channel_matrix=actual_channel_matrix
         )

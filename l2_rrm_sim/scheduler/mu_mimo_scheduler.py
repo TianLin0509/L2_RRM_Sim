@@ -59,12 +59,18 @@ class MUMIMOPFScheduler(SchedulerBase):
                  ue_rank: np.ndarray) -> SchedulingDecision:
         """MU-MIMO PF 调度
 
-        如果没有信道矩阵，退化为 SU-MIMO。
+        使用估计信道 (estimated_channel_matrix) 进行调度决策。
         """
         has_data = ue_buffer_bytes > 0
         num_ue = self.num_ue
         num_prb = self.num_prb
-        has_channel_matrix = (channel_state.channel_matrix is not None)
+        
+        # 优先使用估计信道进行调度决策
+        h_est = channel_state.estimated_channel_matrix
+        if h_est is None:
+            h_est = channel_state.actual_channel_matrix
+            
+        has_channel_matrix = (h_est is not None)
 
         # PF metric
         pf_metric = np.zeros((num_ue, num_prb))
@@ -74,15 +80,13 @@ class MUMIMOPFScheduler(SchedulerBase):
                     achievable_rate_per_prb[ue, :] / max(self._t_avg[ue], 1e-10)
                 )
 
-        # PRB 分配: 支持每 PRB 多 UE
-        # prb_assignment[prb] = primary UE (-1 if unassigned)
-        # mu_mimo_groups[prb] = list of co-scheduled UEs
+        # PRB 分配
         prb_assignment = np.full(num_prb, -1, dtype=np.int32)
         mu_mimo_groups = [[] for _ in range(num_prb)]
 
         if has_channel_matrix:
             self._mu_mimo_schedule(
-                pf_metric, has_data, channel_state.channel_matrix,
+                pf_metric, has_data, h_est,
                 prb_assignment, mu_mimo_groups
             )
         else:
@@ -105,11 +109,9 @@ class MUMIMOPFScheduler(SchedulerBase):
             for ue in mu_mimo_groups[prb]:
                 ue_num_prbs[ue] += 1
 
-        # MU-MIMO 时，每 UE 的有效 rank = 1 (每 UE 单流)
-        # SU-MIMO 时，使用原始 rank
+        # MU-MIMO 时，每 UE 的有效 rank = 1
         for ue in range(num_ue):
             if ue_num_prbs[ue] > 0:
-                # 检查该 UE 是否参与了 MU-MIMO (共调度)
                 is_mu = any(len(mu_mimo_groups[prb]) > 1
                             for prb in range(num_prb)
                             if ue in mu_mimo_groups[prb])
@@ -127,7 +129,7 @@ class MUMIMOPFScheduler(SchedulerBase):
                 )
                 ue_num_re[ue] = self.num_re_per_prb * ue_num_prbs[ue]
 
-        # 用第一个 UE 的 ID 作为 prb_assignment (兼容 SU 接口)
+        # 用第一个 UE 的 ID 作为 prb_assignment
         for prb in range(num_prb):
             if mu_mimo_groups[prb]:
                 prb_assignment[prb] = mu_mimo_groups[prb][0]
@@ -141,29 +143,29 @@ class MUMIMOPFScheduler(SchedulerBase):
             ue_num_re=ue_num_re,
         )
 
-    def _mu_mimo_schedule(self, pf_metric, has_data, channel_matrix,
+    def _mu_mimo_schedule(self, pf_metric, has_data, h_est,
                           prb_assignment, mu_mimo_groups):
-        """MU-MIMO 配对调度"""
+        """MU-MIMO 配对调度 (基于估计信道)"""
         num_ue = self.num_ue
         num_prb = self.num_prb
 
         for prb in range(num_prb):
-            # 候选 UE: 有数据且 PF metric > 0
             candidates = [ue for ue in range(num_ue)
                           if has_data[ue] and pf_metric[ue, prb] > 0]
             if not candidates:
                 continue
 
-            # 按 PF metric 排序
             candidates.sort(key=lambda ue: pf_metric[ue, prb], reverse=True)
 
-            # 贪心配对
             paired = [candidates[0]]
             prb_assignment[prb] = candidates[0]
 
             if len(candidates) > 1 and self.max_co_ue > 1:
-                # 第一个 UE 的信道方向
-                h_ref = channel_matrix[candidates[0], 0, :, prb]  # (tx_ports,)
+                # 提取第一个 UE 的等效信道 (dominant RX antenna)
+                h_ue_full = h_est[candidates[0], :, :, prb]
+                best_rx = np.argmax(np.sum(np.abs(h_ue_full)**2, axis=1))
+                h_ref = h_ue_full[best_rx, :]
+                
                 if np.linalg.norm(h_ref) < 1e-10:
                     mu_mimo_groups[prb] = paired
                     continue
@@ -173,12 +175,15 @@ class MUMIMOPFScheduler(SchedulerBase):
                 for ue in candidates[1:]:
                     if len(paired) >= self.max_co_ue:
                         break
-                    h_ue = channel_matrix[ue, 0, :, prb]
+                    
+                    h_ue_all = h_est[ue, :, :, prb]
+                    b_rx = np.argmax(np.sum(np.abs(h_ue_all)**2, axis=1))
+                    h_ue = h_ue_all[b_rx, :]
+                    
                     if np.linalg.norm(h_ue) < 1e-10:
                         continue
                     h_ue_norm = h_ue / np.linalg.norm(h_ue)
 
-                    # 检查与所有已配对 UE 的正交性
                     is_orthogonal = True
                     for h_paired in paired_directions:
                         similarity = np.abs(np.dot(h_ue_norm.conj(), h_paired))
@@ -201,35 +206,27 @@ class MUMIMOPFScheduler(SchedulerBase):
         self._t_avg = np.maximum(self._t_avg, 1e-10)
 
 
-def compute_zf_precoder(channel_matrix: np.ndarray,
+def compute_zf_precoder(h_est: np.ndarray,
                         paired_ues: list,
                         prb_idx: int) -> np.ndarray:
-    """计算 ZF 预编码矩阵
-
-    Args:
-        channel_matrix: (num_ue, rx_ant, tx_ports, num_prb)
-        paired_ues: 配对 UE 列表
-        prb_idx: PRB 索引
-
-    Returns:
-        W: (tx_ports, num_paired_ue) ZF 预编码矩阵
-    """
+    """计算 ZF 预编码矩阵 (基于估计信道)"""
     num_paired = len(paired_ues)
-    tx_ports = channel_matrix.shape[2]
+    tx_ports = h_est.shape[2]
 
     # 构建等效信道矩阵 H_eq: (num_paired, tx_ports)
-    # 每 UE 取第一根天线
     H_eq = np.zeros((num_paired, tx_ports), dtype=complex)
     for i, ue in enumerate(paired_ues):
-        H_eq[i, :] = channel_matrix[ue, 0, :, prb_idx]
+        h_ue = h_est[ue, :, :, prb_idx]
+        best_rx = np.argmax(np.sum(np.abs(h_ue)**2, axis=1))
+        H_eq[i, :] = h_ue[best_rx, :]
 
     # ZF: W = H^H (H H^H)^{-1}
     try:
-        HHH = H_eq @ H_eq.conj().T  # (K, K)
+        HHH = H_eq @ H_eq.conj().T
         HHH_inv = np.linalg.inv(HHH + 1e-10 * np.eye(num_paired))
-        W = H_eq.conj().T @ HHH_inv  # (tx_ports, K)
+        W = H_eq.conj().T @ HHH_inv
 
-        # 功率归一化 (每列)
+        # 功率归一化
         for k in range(num_paired):
             norm = np.linalg.norm(W[:, k])
             if norm > 0:
@@ -240,32 +237,50 @@ def compute_zf_precoder(channel_matrix: np.ndarray,
     return W
 
 
-def compute_mu_mimo_sinr(channel_matrix: np.ndarray,
+def compute_mu_mimo_sinr(h_actual: np.ndarray,
+                         h_est: np.ndarray,
                          paired_ues: list,
                          prb_idx: int,
                          tx_power_per_prb: float,
                          noise_power: float) -> np.ndarray:
-    """计算 MU-MIMO ZF 后各 UE 的 SINR
+    """计算 MU-MIMO ZF 后各 UE 的真实 SINR
 
-    Returns:
-        sinr: (num_paired,) SINR [linear]
+    Args:
+        h_actual: 真实信道 (Ground Truth)
+        h_est: 估计信道 (用于预编码设计)
+        paired_ues: 配对 UE
+        prb_idx: PRB 索引
+        tx_power_per_prb: 总发射功率 (该 PRB)
+        noise_power: 噪声功率
     """
-    W = compute_zf_precoder(channel_matrix, paired_ues, prb_idx)
+    # 预编码矩阵设计基于估计信道
+    W = compute_zf_precoder(h_est, paired_ues, prb_idx)
     num_paired = len(paired_ues)
     sinr = np.zeros(num_paired)
 
-    # 每 UE 分到的功率 = 总功率 / 配对数
+    # 假设各流功率均分
     power_per_ue = tx_power_per_prb / num_paired
 
     for i, ue in enumerate(paired_ues):
-        h = channel_matrix[ue, 0, :, prb_idx]  # (tx_ports,)
-        # 有效信号
-        signal = np.abs(np.dot(h, W[:, i])) ** 2 * power_per_ue
-        # 干扰 (来自其他流)
+        # 接收端使用实际信道 (Ground Truth)
+        # 且假设 UE 能够利用所有接收天线进行 MRC (最大比合并)
+        h_ue_actual = h_actual[ue, :, :, prb_idx] # (rx_ant, tx_ports)
+        
+        # UE 端组合向量 u (MRC): 对准自己的流
+        # u = (H_actual * W_i)^H
+        eff_h_i = h_ue_actual @ W[:, i] # (rx_ant,)
+        u = eff_h_i.conj() / (np.linalg.norm(eff_h_i) + 1e-10)
+        
+        # 有效信号功率
+        signal = np.abs(np.dot(u, eff_h_i)) ** 2 * power_per_ue
+        
+        # 干扰功率 (来自其他流)
         interference = 0.0
         for j in range(num_paired):
             if j != i:
-                interference += np.abs(np.dot(h, W[:, j])) ** 2 * power_per_ue
+                eff_h_j = h_ue_actual @ W[:, j]
+                interference += np.abs(np.dot(u, eff_h_j)) ** 2 * power_per_ue
+        
         sinr[i] = signal / (interference + noise_power)
 
     return sinr

@@ -269,5 +269,5 @@ class SionnaChannel(ChannelModelBase):
             shadow_fading_db=np.zeros(num_ue),  # 已包含在 Sionna 的信道中
             sinr_per_prb=sinr_per_prb,
             wideband_sinr_db=wideband_sinr_db,
-            channel_matrix=channel_matrix,
+            actual_channel_matrix=channel_matrix,
         )

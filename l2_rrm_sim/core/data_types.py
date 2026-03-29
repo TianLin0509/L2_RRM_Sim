@@ -35,7 +35,10 @@ class ChannelState:
     shadow_fading_db: np.ndarray       # (num_ue,) 阴影衰落 [dB]
     sinr_per_prb: np.ndarray           # (num_ue, max_layers, num_prb) SINR [linear]
     wideband_sinr_db: np.ndarray       # (num_ue,) 宽带 SINR [dB]
-    channel_matrix: np.ndarray = None  # (num_ue, rx_ant, tx_ant, num_prb) [MU-MIMO 用]
+    # 实际信道 (Ground Truth), (num_ue, rx_ant, tx_ant, num_prb)
+    actual_channel_matrix: np.ndarray = None
+    # 估计信道 (含估计误差/反馈延迟), (num_ue, rx_ant, tx_ant, num_prb)
+    estimated_channel_matrix: np.ndarray = None
 
 
 @dataclass

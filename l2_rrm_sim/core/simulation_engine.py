@@ -7,7 +7,8 @@ import time
 import numpy as np
 from ..config.sim_config import (
     SimConfig, CarrierConfig, CellConfig, UEConfig,
-    SchedulerConfig, LinkAdaptationConfig, TrafficConfig, ChannelConfig
+    SchedulerConfig, LinkAdaptationConfig, TrafficConfig, ChannelConfig,
+    CSIConfig,
 )
 from .data_types import SlotContext, UEState, SlotResult
 from .resource_grid import ResourceGrid
@@ -45,6 +46,7 @@ class SimulationEngine:
         self.la_config: LinkAdaptationConfig = config['link_adaptation']
         self.traffic_config: TrafficConfig = config['traffic']
         self.channel_config: ChannelConfig = config['channel']
+        self.csi_config: CSIConfig = config.get('csi', CSIConfig())
 
         # 随机数
         self.rng = SimRNG(self.sim_config.random_seed)
@@ -123,6 +125,34 @@ class SimulationEngine:
             mcs_table_index=self.la_config.mcs_table_index,
             beta=self.scheduler_config.beta,
         )
+
+        # CSI 反馈 + SINR 预估
+        self._csi_enabled = self.csi_config.enabled and (channel_type == 'sionna')
+        if self._csi_enabled:
+            from ..csi.csi_feedback import CSIFeedbackManager
+            from ..csi.sinr_prediction import SINRPredictor
+
+            noise_per_prb = (1.380649e-23 * 290
+                             * self.carrier_config.subcarrier_spacing * 1e3 * 12
+                             * 10 ** (self.cell_config.noise_figure_db / 10))
+            # CSI codebook 匹配物理天线数 (channel_matrix 的 tx 维度)
+            num_tx_for_csi = self.cell_config.num_tx_ant
+            if hasattr(self.channel, '_num_tx_ant'):
+                num_tx_for_csi = self.channel._num_tx_ant
+            self.csi_manager = CSIFeedbackManager(
+                num_ue=self.num_ue,
+                num_tx_ports=num_tx_for_csi,
+                max_rank=min(self.cell_config.max_layers, self.ue_config.num_rx_ant),
+                csi_period_slots=self.csi_config.csi_period_slots,
+                feedback_delay_slots=self.csi_config.feedback_delay_slots,
+                noise_power_per_prb=noise_per_prb,
+                codebook_oversampling=self.csi_config.codebook_oversampling,
+            )
+            self.sinr_predictor = SINRPredictor(
+                num_ue=self.num_ue,
+                num_tx_ports=num_tx_for_csi,
+                codebook=self.csi_manager.codebook,
+            )
 
         # 流量模型
         self.traffic = FullBufferTraffic()
@@ -234,10 +264,36 @@ class SimulationEngine:
         # 2. 信道更新
         channel_state = self.channel.update(slot_ctx, self.ue_states)
 
-        # 3. Rank 选择
-        ue_rank = self.rank_adapter.select_rank_batch(
-            channel_state.sinr_per_prb, num_ue
-        )
+        # 3. CSI 测量与反馈 (周期性)
+        if self._csi_enabled:
+            # 接收到期的 CSI 反馈
+            self.csi_manager.receive_feedback(slot_idx)
+
+            # 周期性 CSI 测量
+            if self.csi_manager.should_measure(slot_idx):
+                if channel_state.channel_matrix is not None:
+                    tx_pwr = self.cell_config.total_power_dbm
+                    from ..utils.math_utils import dbm_to_watt
+                    tx_per_prb = dbm_to_watt(tx_pwr) / num_prb
+                    self.csi_manager.measure_and_report(
+                        slot_idx, channel_state.channel_matrix, tx_per_prb
+                    )
+
+        # 4. Rank 选择 (优先使用 CSI RI)
+        ue_rank = np.ones(num_ue, dtype=np.int32)
+        if self._csi_enabled:
+            for ue_idx in range(num_ue):
+                report = self.csi_manager.get_latest_report(ue_idx)
+                if report is not None:
+                    ue_rank[ue_idx] = report.ri
+                else:
+                    ue_rank[ue_idx] = self.rank_adapter.select_rank(
+                        channel_state.sinr_per_prb[ue_idx]
+                    )
+        else:
+            ue_rank = self.rank_adapter.select_rank_batch(
+                channel_state.sinr_per_prb, num_ue
+            )
         for ue_idx, ue in enumerate(self.ue_states):
             ue.selected_rank = int(ue_rank[ue_idx])
 
@@ -252,12 +308,26 @@ class SimulationEngine:
         num_prb = self.carrier_config.num_prb
         re_per_prb = self.resource_grid.num_re_per_prb
 
-        # 4. MCS 选择 (Sionna OLLA: 内含 EESM + ILLA + 偏移管理)
+        # 5. SINR 预估 (CSI-based) → 用于 OLLA 的 sinr_eff 输入
+        sinr_eff_for_olla = self._last_sinr_eff.copy()
+        if self._csi_enabled and channel_state.channel_matrix is not None:
+            csi_reports = self.csi_manager.get_all_latest_reports()
+            sinr_pred_db = self.sinr_predictor.predict_all_ue(
+                csi_reports, channel_state.channel_matrix, mode='su'
+            )
+            # 将 SINR 预估 (dB) 转为 linear, 用于 OLLA
+            from ..utils.math_utils import db_to_linear
+            for ue in range(num_ue):
+                if csi_reports[ue] is not None and sinr_pred_db[ue] > -29:
+                    sinr_eff_for_olla[ue] = db_to_linear(sinr_pred_db[ue])
+
+        # 6. MCS 选择 (Sionna OLLA: 内含 EESM + ILLA)
+        #    sinr_eff_for_olla 提供 informed 初始估计, OLLA 在此基础上微调
         est_re = np.full(num_ue, re_per_prb * max(num_prb // num_ue, 1), dtype=np.int32)
         mcs_indices = self.sionna_phy.select_mcs(
             num_allocated_re=est_re,
             harq_feedback=self._last_harq.copy(),
-            sinr_eff=self._last_sinr_eff.copy(),
+            sinr_eff=sinr_eff_for_olla,
             scheduled_mask=self._last_scheduled_mask,
         )
 

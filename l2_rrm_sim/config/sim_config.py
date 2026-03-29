@@ -91,9 +91,18 @@ class TrafficConfig:
 
 
 @dataclass
+class CSIConfig:
+    """CSI 反馈配置"""
+    enabled: bool = True               # 是否启用 CSI 反馈
+    csi_period_slots: int = 10         # CSI-RS 周期 (slots)
+    feedback_delay_slots: int = 4      # 反馈延迟 (slots)
+    codebook_oversampling: int = 1     # Codebook oversampling factor
+
+
+@dataclass
 class ChannelConfig:
     """信道配置"""
-    type: str = "statistical"          # 信道类型 (statistical/ray_tracing)
+    type: str = "statistical"          # 信道类型 (statistical/sionna)
     scenario: str = "uma"              # 3GPP 场景
     shadow_fading_std_db: float = 4.0  # 阴影衰落标准差 (dB) — LOS UMa
 
@@ -113,5 +122,6 @@ def load_config(yaml_path: str) -> dict:
         'link_adaptation': LinkAdaptationConfig(**raw.get('link_adaptation', {})),
         'traffic': TrafficConfig(**raw.get('traffic', {})),
         'channel': ChannelConfig(**raw.get('channel', {})),
+        'csi': CSIConfig(**raw.get('csi', {})),
     }
     return config

@@ -15,17 +15,11 @@ from .nr_constants import SLOTS_PER_FRAME, SLOTS_PER_SUBFRAME
 from ..channel.statistical_channel import StatisticalChannel
 from ..scheduler.pf_scheduler import PFSchedulerSUMIMO
 from ..scheduler.rank_adaptation import RankAdapter
-from ..link_adaptation.bler_tables import BLERTableManager
-from ..link_adaptation.effective_sinr import EESM
-from ..link_adaptation.illa import ILLA
-from ..link_adaptation.olla import OLLA
-from ..link_adaptation.phy_abstraction import PHYAbstraction
 from ..traffic.full_buffer import FullBufferTraffic
 from ..traffic.buffer_manager import BufferManager
 from ..kpi.kpi_collector import KPICollector
 from ..kpi.kpi_reporter import KPIReporter
 from ..utils.math_utils import linear_to_db
-from ..utils.nr_utils import get_spectral_efficiency
 from ..utils.random_utils import SimRNG
 
 
@@ -67,7 +61,8 @@ class SimulationEngine:
         if channel_type == 'sionna':
             from ..channel.sionna_channel import SionnaChannel
             self.channel = SionnaChannel(
-                self.cell_config, self.carrier_config, self.channel_config
+                self.cell_config, self.carrier_config, self.channel_config,
+                ue_config=self.ue_config,
             )
         else:
             self.channel = StatisticalChannel(
@@ -85,29 +80,40 @@ class SimulationEngine:
             fixed_rank=1 if use_fixed_rank else None,
         )
 
-        # 链路自适应
-        self.bler_table = BLERTableManager()
-        self.eesm = EESM()
-        self.illa = ILLA(
-            self.bler_table,
-            bler_target=self.la_config.bler_target,
-            mcs_table_index=self.la_config.mcs_table_index,
-            num_re_per_prb=self.resource_grid.num_re_per_prb
-        )
-        self.olla = OLLA(
-            num_ue=self.num_ue,
-            illa=self.illa,
-            bler_target=self.la_config.bler_target,
-            delta_up=self.la_config.olla_delta_up,
-            offset_min=self.la_config.olla_offset_min,
-            offset_max=self.la_config.olla_offset_max,
-        )
-        self.phy_abs = PHYAbstraction(
-            self.bler_table, self.eesm,
-            num_re_per_prb=self.resource_grid.num_re_per_prb,
-            mcs_table_index=self.la_config.mcs_table_index,
-            rng=self.rng.phy,
-        )
+        # PHY 层 (EESM + OLLA + ILLA + BLER 查表)
+        # 优先使用 Sionna PHY (3GPP 合规); 不可用时回退到自实现
+        try:
+            from ..link_adaptation.sionna_phy import SionnaPHY
+            self.sionna_phy = SionnaPHY(
+                num_ue=self.num_ue,
+                bler_target=self.la_config.bler_target,
+                delta_up=self.la_config.olla_delta_up,
+                offset_min=self.la_config.olla_offset_min,
+                offset_max=self.la_config.olla_offset_max,
+                mcs_table_index=self.la_config.mcs_table_index,
+            )
+            self._use_sionna_phy = True
+        except (ImportError, RuntimeError):
+            # 回退到自实现
+            from ..link_adaptation.bler_tables import BLERTableManager
+            from ..link_adaptation.effective_sinr import EESM
+            from ..link_adaptation.illa import ILLA
+            from ..link_adaptation.olla import OLLA
+            from ..link_adaptation.phy_abstraction import PHYAbstraction
+            self.bler_table = BLERTableManager()
+            self.eesm = EESM()
+            self.illa = ILLA(self.bler_table, self.la_config.bler_target,
+                             self.la_config.mcs_table_index,
+                             self.resource_grid.num_re_per_prb)
+            self.olla = OLLA(self.num_ue, self.illa, self.la_config.bler_target,
+                             self.la_config.olla_delta_up,
+                             self.la_config.olla_offset_min,
+                             self.la_config.olla_offset_max)
+            self.phy_abs = PHYAbstraction(self.bler_table, self.eesm,
+                                          self.resource_grid.num_re_per_prb,
+                                          self.la_config.mcs_table_index,
+                                          self.rng.phy)
+            self._use_sionna_phy = False
 
         # 调度器
         self.scheduler = PFSchedulerSUMIMO(
@@ -128,9 +134,12 @@ class SimulationEngine:
             warmup_slots=self.sim_config.warmup_slots
         )
 
-        # HARQ 反馈缓存 (上一 TTI)
-        self._last_harq_ack = np.ones(self.num_ue, dtype=bool)
+        # 反馈缓存 (上一 TTI)
+        self._last_harq = np.ones(self.num_ue, dtype=np.int32)  # 1=ACK
+        self._last_harq_ack = np.ones(self.num_ue, dtype=bool)  # legacy 兼容
+        self._last_sinr_eff = np.ones(self.num_ue, dtype=np.float32)  # linear
         self._last_scheduled_mask = np.zeros(self.num_ue, dtype=bool)
+        self._buf_after_traffic = np.zeros(self.num_ue, dtype=np.int64)
 
     def _init_ue_states(self) -> list:
         """初始化 UE 位置和状态"""
@@ -232,40 +241,35 @@ class SimulationEngine:
         for ue_idx, ue in enumerate(self.ue_states):
             ue.selected_rank = int(ue_rank[ue_idx])
 
-        # 4. OLLA: 只对上一 TTI 被调度的 UE 更新偏移
-        self.olla.update_offsets_batch(
-            self._last_harq_ack, self._last_scheduled_mask
+        if self._use_sionna_phy:
+            return self._run_slot_sionna_phy(slot_ctx, channel_state, ue_rank)
+        else:
+            return self._run_slot_legacy_phy(slot_ctx, channel_state, ue_rank)
+
+    def _run_slot_sionna_phy(self, slot_ctx, channel_state, ue_rank):
+        """使用 Sionna PHY 层的 slot 处理"""
+        num_ue = self.num_ue
+        num_prb = self.carrier_config.num_prb
+        re_per_prb = self.resource_grid.num_re_per_prb
+
+        # 4. MCS 选择 (Sionna OLLA: 内含 EESM + ILLA + 偏移管理)
+        est_re = np.full(num_ue, re_per_prb * max(num_prb // num_ue, 1), dtype=np.int32)
+        mcs_indices = self.sionna_phy.select_mcs(
+            num_allocated_re=est_re,
+            harq_feedback=self._last_harq.copy(),
+            sinr_eff=self._last_sinr_eff.copy(),
+            scheduled_mask=self._last_scheduled_mask,
         )
 
-        # 5. MCS 选择
-        sinr_eff_db = np.zeros(num_ue)
-        est_prbs = np.full(num_ue, max(num_prb // num_ue, 1), dtype=np.int32)
-
-        # EESM: 使用 MCS 0 的 beta (保守估计, 避免高估 SINR)
-        for ue in range(num_ue):
-            r = int(ue_rank[ue])
-            sinr_eff_db[ue] = self.eesm.compute(
-                channel_state.sinr_per_prb[ue, :r, :],
-                mcs_index=0,
-                table_index=self.la_config.mcs_table_index
-            )
-
-        # OLLA 选择 MCS (内部 ILLA 会用 BLER 表逐 MCS 查找)
-        mcs_indices = self.olla.select_mcs(sinr_eff_db, est_prbs, ue_rank)
-
-        # 6. 计算 per-PRB 可达速率 (用于 PF metric)
-        #    使用 Shannon 容量作为 per-PRB 速率估计, 避免与 MCS 耦合
+        # 5. 计算 per-PRB 可达速率 (Shannon 容量, 用于 PF metric)
         achievable_rate_per_prb = np.zeros((num_ue, num_prb))
-        re_per_prb = self.resource_grid.num_re_per_prb
         for ue in range(num_ue):
             r = int(ue_rank[ue])
-            # per-PRB Shannon 容量 (考虑 rank)
-            sinr_prb = channel_state.sinr_per_prb[ue, :r, :]  # (rank, num_prb)
-            # 各层的 log2(1+SINR) 求和, 乘以 RE 数
-            capacity_per_prb = np.sum(np.log2(1.0 + np.maximum(sinr_prb, 0)), axis=0)
-            achievable_rate_per_prb[ue, :] = capacity_per_prb * re_per_prb
+            sinr_prb = channel_state.sinr_per_prb[ue, :r, :]
+            capacity = np.sum(np.log2(1.0 + np.maximum(sinr_prb, 0)), axis=0)
+            achievable_rate_per_prb[ue, :] = capacity * re_per_prb
 
-        # 7. PF 调度
+        # 6. PF 调度
         ue_buffer = np.array([ue.buffer_bytes for ue in self.ue_states])
         sched = self.scheduler.schedule(
             slot_ctx, self.ue_states, channel_state,
@@ -273,35 +277,89 @@ class SimulationEngine:
             mcs_indices, ue_rank
         )
 
-        # 8. 被调度 UE: 用实际分配 PRB 重新计算精确 EESM
-        for ue in range(num_ue):
-            if sched.ue_num_prbs[ue] > 0:
-                r = int(ue_rank[ue])
-                ue_prbs = (sched.prb_assignment == ue)
-                sinr_ue = channel_state.sinr_per_prb[ue, :r, :][:, ue_prbs]
-                sinr_eff_db[ue] = self.eesm.compute(
-                    sinr_ue, int(mcs_indices[ue]),
-                    self.la_config.mcs_table_index
-                )
-
-        # 9. PHY 抽象: 评估传输结果
-        phy_results = self.phy_abs.evaluate_batch(
-            channel_state.sinr_per_prb,
-            mcs_indices, sched.ue_num_prbs, ue_rank,
-            sched.prb_assignment
+        # 7. PHY 评估 (Sionna: EESM + BLER 查表 + HARQ 判定)
+        ue_num_re = sched.ue_num_prbs * re_per_prb
+        phy_results = self.sionna_phy.evaluate(
+            mcs_indices=mcs_indices,
+            sinr_per_re=channel_state.sinr_per_prb,
+            num_allocated_re=ue_num_re.astype(np.int32),
+            prb_assignment=sched.prb_assignment,
         )
 
-        # 10. 更新 HARQ 反馈和 UE 状态
-        self._last_harq_ack = phy_results['is_success'].copy()
+        # 8. 更新状态
+        self._last_harq = phy_results['harq_feedback'].copy()
+        self._last_sinr_eff = phy_results['sinr_eff'].copy()
         self._last_scheduled_mask = sched.ue_num_prbs > 0
-        for ue_idx, ue in enumerate(self.ue_states):
-            ue.last_harq_ack = bool(self._last_harq_ack[ue_idx])
-            ue.sinr_eff_db_last = float(sinr_eff_db[ue_idx])
 
-        # 11. 更新缓冲区
+        sinr_eff_db = np.where(
+            phy_results['sinr_eff'] > 0,
+            linear_to_db(phy_results['sinr_eff']),
+            -30.0
+        )
+
+        return self._finalize_slot(slot_ctx, phy_results, mcs_indices,
+                                    ue_rank, sinr_eff_db, sched)
+
+    def _run_slot_legacy_phy(self, slot_ctx, channel_state, ue_rank):
+        """使用自实现 PHY 层的 slot 处理 (回退模式)"""
+        from ..utils.nr_utils import get_spectral_efficiency
+        num_ue = self.num_ue
+        num_prb = self.carrier_config.num_prb
+        re_per_prb = self.resource_grid.num_re_per_prb
+
+        # OLLA 更新
+        self.olla.update_offsets_batch(
+            self._last_harq_ack, self._last_scheduled_mask
+        )
+
+        # EESM + MCS
+        sinr_eff_db = np.zeros(num_ue)
+        est_prbs = np.full(num_ue, max(num_prb // num_ue, 1), dtype=np.int32)
+        for ue in range(num_ue):
+            r = int(ue_rank[ue])
+            sinr_eff_db[ue] = self.eesm.compute(
+                channel_state.sinr_per_prb[ue, :r, :], mcs_index=0,
+                table_index=self.la_config.mcs_table_index
+            )
+        mcs_indices = self.olla.select_mcs(sinr_eff_db, est_prbs, ue_rank)
+
+        # Achievable rate
+        achievable_rate_per_prb = np.zeros((num_ue, num_prb))
+        for ue in range(num_ue):
+            r = int(ue_rank[ue])
+            sinr_prb = channel_state.sinr_per_prb[ue, :r, :]
+            capacity = np.sum(np.log2(1.0 + np.maximum(sinr_prb, 0)), axis=0)
+            achievable_rate_per_prb[ue, :] = capacity * re_per_prb
+
+        # PF 调度
+        ue_buffer = np.array([ue.buffer_bytes for ue in self.ue_states])
+        sched = self.scheduler.schedule(
+            slot_ctx, self.ue_states, channel_state,
+            achievable_rate_per_prb, ue_buffer, mcs_indices, ue_rank
+        )
+
+        # PHY 评估
+        phy_results = self.phy_abs.evaluate_batch(
+            channel_state.sinr_per_prb, mcs_indices,
+            sched.ue_num_prbs, ue_rank, sched.prb_assignment
+        )
+
+        # 更新状态
+        self._last_harq_ack = phy_results['is_success'].copy()
+        self._last_harq = np.where(phy_results['is_success'], 1, 0).astype(np.int32)
+        self._last_sinr_eff = np.ones(num_ue, dtype=np.float32)
+        self._last_scheduled_mask = sched.ue_num_prbs > 0
+
+        return self._finalize_slot(slot_ctx, phy_results, mcs_indices,
+                                    ue_rank, sinr_eff_db, sched)
+
+    def _finalize_slot(self, slot_ctx, phy_results, mcs_indices,
+                       ue_rank, sinr_eff_db, sched):
+        """slot 后续处理: 缓冲区更新, 调度器更新, 构造 SlotResult"""
+        # 更新缓冲区
         self.buffer_mgr.dequeue(self.ue_states, phy_results['decoded_bits'])
 
-        # 12. 更新调度器吞吐量历史
+        # 更新调度器吞吐量历史
         self.scheduler.update_throughput_history(
             phy_results['decoded_bits'].astype(np.float64)
         )
@@ -311,7 +369,7 @@ class SimulationEngine:
         throughput_inst = phy_results['decoded_bits'].astype(np.float64) / slot_duration_s
 
         return SlotResult(
-            slot_idx=slot_idx,
+            slot_idx=slot_ctx.slot_idx,
             ue_decoded_bits=phy_results['decoded_bits'],
             ue_bler=phy_results['tbler'],
             ue_tb_success=phy_results['is_success'],

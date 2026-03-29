@@ -45,9 +45,11 @@ class SionnaChannel(ChannelModelBase):
     def __init__(self, cell_config: CellConfig,
                  carrier_config: CarrierConfig,
                  channel_config: ChannelConfig = None,
+                 ue_config=None,
                  device: str = None):
         """
         Args:
+            ue_config: UEConfig (用于获取 num_rx_ant)
             device: PyTorch 设备 ('cuda:0', 'cpu', None=自动)
         """
         if not SIONNA_AVAILABLE:
@@ -68,11 +70,12 @@ class SionnaChannel(ChannelModelBase):
 
         # 天线配置
         carrier_freq = carrier_config.carrier_freq_ghz * 1e9
+        num_rx_ant = ue_config.num_rx_ant if ue_config else 2
 
-        # UE 天线: 单面板, 单极化
+        # UE 天线: 单面板, 单极化, 按 num_rx_ant 配置
         self._ut_array = PanelArray(
             num_rows_per_panel=1,
-            num_cols_per_panel=cell_config.num_tx_ports // 2 if cell_config.num_tx_ports > 1 else 1,
+            num_cols_per_panel=max(1, num_rx_ant),
             polarization='single',
             polarization_type='V',
             antenna_pattern='omni',
@@ -185,7 +188,12 @@ class SionnaChannel(ChannelModelBase):
 
         num_ue = self._num_ue
         num_prb = self._num_prb
-        max_layers = self.cell_config.max_layers
+        # max_layers 不能超过 min(rx_ant, tx_ports)
+        max_layers = min(
+            self.cell_config.max_layers,
+            self._num_rx_ant,
+            self.cell_config.num_tx_ports,
+        )
 
         with torch.no_grad():
             # 1. 生成 CIR

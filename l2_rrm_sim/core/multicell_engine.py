@@ -19,16 +19,8 @@ from .topology import HexGridTopology
 from .nr_constants import SLOTS_PER_FRAME, SLOTS_PER_SUBFRAME
 from ..channel.pathloss_models import PATHLOSS_MODELS
 from ..channel.interference_model import InterCellInterference
-from ..channel.statistical_channel import StatisticalChannel
 from ..scheduler.pf_scheduler import PFSchedulerSUMIMO
-from ..scheduler.rank_adaptation import RankAdapter
-from ..link_adaptation.bler_tables import BLERTableManager
-from ..link_adaptation.effective_sinr import EESM
-from ..link_adaptation.illa import ILLA
-from ..link_adaptation.olla import OLLA
-from ..link_adaptation.phy_abstraction import PHYAbstraction
 from ..traffic.full_buffer import FullBufferTraffic
-from ..traffic.buffer_manager import BufferManager
 from ..kpi.kpi_collector import KPICollector
 from ..kpi.kpi_reporter import KPIReporter
 from ..utils.math_utils import db_to_linear, dbm_to_watt, linear_to_db
@@ -117,25 +109,21 @@ class MultiCellSimulationEngine:
         )
 
         # 共享模块
-        self.bler_table = BLERTableManager()
-        self.eesm = EESM()
-        self.rank_adapter = RankAdapter(
-            max_rank=self.cell_config.max_layers,
-            fixed_rank=1
-        )
         self.traffic = FullBufferTraffic()
 
-        # 每小区独立的调度器、OLLA
+        # PHY 层: Sionna 或 legacy
+        try:
+            from ..link_adaptation.sionna_phy import SionnaPHY
+            self._use_sionna_phy = True
+        except ImportError:
+            self._use_sionna_phy = False
+
+        # 每小区独立的调度器、PHY
         self.cell_schedulers = {}
-        self.cell_ollas = {}
+        self.cell_phy = {}
         self.cell_kpis = {}
 
         for cell_idx in range(self.num_cells):
-            illa = ILLA(self.bler_table,
-                        bler_target=self.la_config.bler_target,
-                        mcs_table_index=self.la_config.mcs_table_index,
-                        num_re_per_prb=self.resource_grid.num_re_per_prb)
-
             self.cell_schedulers[cell_idx] = PFSchedulerSUMIMO(
                 num_ue=num_ue_per_cell,
                 num_prb=self.carrier_config.num_prb,
@@ -144,12 +132,27 @@ class MultiCellSimulationEngine:
                 beta=self.scheduler_config.beta,
             )
 
-            self.cell_ollas[cell_idx] = OLLA(
-                num_ue=num_ue_per_cell,
-                illa=illa,
-                bler_target=self.la_config.bler_target,
-                delta_up=self.la_config.olla_delta_up,
-            )
+            if self._use_sionna_phy:
+                self.cell_phy[cell_idx] = SionnaPHY(
+                    num_ue=num_ue_per_cell,
+                    bler_target=self.la_config.bler_target,
+                    delta_up=self.la_config.olla_delta_up,
+                    mcs_table_index=self.la_config.mcs_table_index,
+                )
+            else:
+                from ..link_adaptation.bler_tables import BLERTableManager
+                from ..link_adaptation.effective_sinr import EESM
+                from ..link_adaptation.illa import ILLA
+                from ..link_adaptation.olla import OLLA
+                bt = BLERTableManager(); eesm = EESM()
+                illa = ILLA(bt, self.la_config.bler_target,
+                            self.la_config.mcs_table_index,
+                            self.resource_grid.num_re_per_prb)
+                self.cell_phy[cell_idx] = {
+                    'olla': OLLA(num_ue_per_cell, illa, self.la_config.bler_target,
+                                 self.la_config.olla_delta_up),
+                    'eesm': eesm,
+                }
 
             self.cell_kpis[cell_idx] = KPICollector(
                 self.sim_config.num_slots,
@@ -157,17 +160,21 @@ class MultiCellSimulationEngine:
                 warmup_slots=self.sim_config.warmup_slots
             )
 
-        # PHY 抽象
-        self.phy_abs = PHYAbstraction(
-            self.bler_table, self.eesm,
-            num_re_per_prb=self.resource_grid.num_re_per_prb,
-            mcs_table_index=self.la_config.mcs_table_index,
-            rng=self.rng.phy,
-        )
+        # Legacy PHY 抽象 (fallback)
+        if not self._use_sionna_phy:
+            from ..link_adaptation.bler_tables import BLERTableManager
+            from ..link_adaptation.effective_sinr import EESM
+            from ..link_adaptation.phy_abstraction import PHYAbstraction
+            self.phy_abs = PHYAbstraction(
+                BLERTableManager(), EESM(),
+                self.resource_grid.num_re_per_prb,
+                self.la_config.mcs_table_index,
+                self.rng.phy,
+            )
 
-        # Per-cell HARQ feedback
+        # Per-cell HARQ feedback (Sionna 用 int32: 1=ACK, 0=NACK, -1=unscheduled)
         self._cell_last_harq = {
-            c: np.ones(num_ue_per_cell, dtype=bool) for c in range(self.num_cells)
+            c: np.ones(num_ue_per_cell, dtype=np.int32) for c in range(self.num_cells)
         }
         self._cell_last_scheduled = {
             c: np.zeros(num_ue_per_cell, dtype=bool) for c in range(self.num_cells)
@@ -224,20 +231,18 @@ class MultiCellSimulationEngine:
 
     def _run_cell_slot(self, cell_idx: int, slot_ctx: SlotContext,
                        pl_func) -> SlotResult:
-        """运行单小区单 slot (简化版，含干扰)"""
+        """运行单小区单 slot (含干扰, 支持 Sionna PHY)"""
         ue_states = self.cell_ue_states[cell_idx]
         num_ue = len(ue_states)
         num_prb = self.carrier_config.num_prb
+        re_per_prb = self.resource_grid.num_re_per_prb
         scheduler = self.cell_schedulers[cell_idx]
-        olla = self.cell_ollas[cell_idx]
 
         # 流量
         self.traffic.generate(slot_ctx, ue_states)
 
         # 信道 + 干扰 → SINR
         sinr_per_prb = np.zeros((num_ue, self.cell_config.max_layers, num_prb))
-        sinr_eff_db = np.zeros(num_ue)
-
         tx_power_per_prb = dbm_to_watt(self.cell_config.total_power_dbm) / num_prb
         bw_prb_hz = self.carrier_config.subcarrier_spacing * 1e3 * 12
         noise_power = (1.380649e-23 * 290 * bw_prb_hz
@@ -246,41 +251,37 @@ class MultiCellSimulationEngine:
         for ue_idx, ue in enumerate(ue_states):
             d_2d = self.topology.compute_distance_2d(ue.position, cell_idx)
             d_2d = max(d_2d, 10.0)
-
             is_los = d_2d < 100.0
             pl_db = pl_func(d_2d, self.cell_config.height_m,
-                            ue.position[2], self.carrier_config.carrier_freq_ghz,
-                            is_los)
+                            ue.position[2], self.carrier_config.carrier_freq_ghz, is_los)
             pl_linear = db_to_linear(pl_db)
-
-            # 快衰落
-            fading = self.rng.channel.exponential(
-                1.0, (self.cell_config.max_layers, num_prb)
-            )
-
-            # 干扰
+            fading = self.rng.channel.exponential(1.0, (self.cell_config.max_layers, num_prb))
             intf = self._ue_interference.get((cell_idx, ue_idx), 0.0)
+            sinr_per_prb[ue_idx] = tx_power_per_prb * fading / (pl_linear * (noise_power + intf))
 
-            # SINR = signal / (noise + interference)
-            sinr_per_prb[ue_idx] = (
-                tx_power_per_prb * fading / (pl_linear * (noise_power + intf))
-            )
-            sinr_eff_db[ue_idx] = linear_to_db(np.mean(sinr_per_prb[ue_idx, 0, :]))
-
-        # Rank
         ue_rank = np.ones(num_ue, dtype=np.int32)
 
-        # OLLA
-        olla.update_offsets_batch(
-            self._cell_last_harq[cell_idx],
-            self._cell_last_scheduled[cell_idx]
-        )
-        est_prbs = np.full(num_ue, max(num_prb // num_ue, 1), dtype=np.int32)
-        mcs_indices = olla.select_mcs(sinr_eff_db, est_prbs, ue_rank)
+        # MCS 选择 + PHY 评估
+        if self._use_sionna_phy:
+            phy = self.cell_phy[cell_idx]
+            est_re = np.full(num_ue, re_per_prb * max(num_prb // num_ue, 1), dtype=np.int32)
+            mcs_indices = phy.select_mcs(
+                num_allocated_re=est_re,
+                harq_feedback=self._cell_last_harq[cell_idx],
+                scheduled_mask=self._cell_last_scheduled[cell_idx],
+            )
+        else:
+            phy_dict = self.cell_phy[cell_idx]
+            phy_dict['olla'].update_offsets_batch(
+                self._cell_last_harq[cell_idx].astype(bool),
+                self._cell_last_scheduled[cell_idx])
+            sinr_eff_db = np.array([linear_to_db(np.mean(sinr_per_prb[u, 0, :]))
+                                    for u in range(num_ue)])
+            est_prbs = np.full(num_ue, max(num_prb // num_ue, 1), dtype=np.int32)
+            mcs_indices = phy_dict['olla'].select_mcs(sinr_eff_db, est_prbs, ue_rank)
 
-        # PF 调度: 使用 Shannon 容量 (含 rank)
+        # PF 调度
         achievable = np.zeros((num_ue, num_prb))
-        re_per_prb = self.resource_grid.num_re_per_prb
         for ue in range(num_ue):
             r = int(ue_rank[ue])
             sinr_prb = sinr_per_prb[ue, :r, :]
@@ -293,21 +294,38 @@ class MultiCellSimulationEngine:
             achievable, ue_buffer, mcs_indices, ue_rank
         )
 
-        # PHY
-        phy_results = self.phy_abs.evaluate_batch(
-            sinr_per_prb, mcs_indices,
-            sched.ue_num_prbs, ue_rank, sched.prb_assignment
-        )
+        # PHY 评估
+        if self._use_sionna_phy:
+            ue_num_re = sched.ue_num_prbs * re_per_prb
+            phy_results = phy.evaluate(
+                mcs_indices=mcs_indices,
+                sinr_per_re=sinr_per_prb,
+                num_allocated_re=ue_num_re.astype(np.int32),
+                prb_assignment=sched.prb_assignment,
+            )
+        else:
+            phy_results = self.phy_abs.evaluate_batch(
+                sinr_per_prb, mcs_indices,
+                sched.ue_num_prbs, ue_rank, sched.prb_assignment
+            )
 
         # 更新状态
-        self._cell_last_harq[cell_idx] = phy_results['is_success'].copy()
+        if self._use_sionna_phy:
+            self._cell_last_harq[cell_idx] = phy_results['harq_feedback'].copy()
+        else:
+            self._cell_last_harq[cell_idx] = np.where(
+                phy_results['is_success'], 1, 0).astype(np.int32)
         self._cell_last_scheduled[cell_idx] = sched.ue_num_prbs > 0
         scheduler.update_throughput_history(phy_results['decoded_bits'].astype(float))
 
-        # BufferManager
         for ue_idx, ue in enumerate(ue_states):
             tx_bytes = int(phy_results['decoded_bits'][ue_idx]) // 8
             ue.buffer_bytes = max(0, ue.buffer_bytes - tx_bytes)
+
+        sinr_eff_db = np.zeros(num_ue)
+        if 'sinr_eff' in phy_results and phy_results['sinr_eff'] is not None:
+            sinr_eff_db = np.where(phy_results['sinr_eff'] > 0,
+                                    linear_to_db(phy_results['sinr_eff']), -30.0)
 
         slot_duration_s = self.carrier_config.slot_duration_s
         return SlotResult(

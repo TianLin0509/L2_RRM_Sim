@@ -154,6 +154,16 @@ class SimulationEngine:
                 codebook=self.csi_manager.codebook,
             )
 
+        # HARQ 管理器
+        from ..harq.harq_buffer import HARQManager
+        self.harq_mgr = HARQManager(
+            num_ue=self.num_ue,
+            num_processes=16,
+            max_retx=4,
+        )
+        # per-UE 的活跃 HARQ process ID (-1 = 无)
+        self._active_harq_pid = np.full(self.num_ue, -1, dtype=np.int32)
+
         # 流量模型
         self.traffic = FullBufferTraffic()
         self.buffer_mgr = BufferManager(self.num_ue)
@@ -261,7 +271,20 @@ class SimulationEngine:
             [ue.buffer_bytes for ue in self.ue_states], dtype=np.int64
         )
 
-        # 2. 信道更新
+        # 2. UE 移动性: 更新位置 (每 slot)
+        slot_duration = self.carrier_config.slot_duration_s
+        for ue in self.ue_states:
+            ue.position = ue.position + ue.velocity * slot_duration
+
+        # 周期性重设 Sionna 拓扑 (每 topology_update_period slots)
+        # 让 Sionna 内部更新 LSP 和 Doppler
+        topo_period = getattr(self, '_topo_update_period', 20)
+        if (slot_idx % topo_period == 0
+                and hasattr(self.channel, 'initialize')
+                and self.channel_config.type.lower() == 'sionna'):
+            self.channel.initialize(self.cell_config, self.carrier_config, self.ue_states)
+
+        # 信道更新
         channel_state = self.channel.update(slot_ctx, self.ue_states)
 
         # 3. CSI 测量与反馈 (周期性)
@@ -303,26 +326,25 @@ class SimulationEngine:
             return self._run_slot_legacy_phy(slot_ctx, channel_state, ue_rank)
 
     def _run_slot_sionna_phy(self, slot_ctx, channel_state, ue_rank):
-        """使用 Sionna PHY 层的 slot 处理"""
+        """使用 Sionna PHY 层的 slot 处理 (含 HARQ)"""
         num_ue = self.num_ue
         num_prb = self.carrier_config.num_prb
         re_per_prb = self.resource_grid.num_re_per_prb
+        slot_idx = slot_ctx.slot_idx
 
-        # 5. SINR 预估 (CSI-based) → 用于 OLLA 的 sinr_eff 输入
+        # --- SINR 预估 (CSI-based) ---
         sinr_eff_for_olla = self._last_sinr_eff.copy()
         if self._csi_enabled and channel_state.channel_matrix is not None:
             csi_reports = self.csi_manager.get_all_latest_reports()
             sinr_pred_db = self.sinr_predictor.predict_all_ue(
                 csi_reports, channel_state.channel_matrix, mode='su'
             )
-            # 将 SINR 预估 (dB) 转为 linear, 用于 OLLA
             from ..utils.math_utils import db_to_linear
             for ue in range(num_ue):
                 if csi_reports[ue] is not None and sinr_pred_db[ue] > -29:
                     sinr_eff_for_olla[ue] = db_to_linear(sinr_pred_db[ue])
 
-        # 6. MCS 选择 (Sionna OLLA: 内含 EESM + ILLA)
-        #    sinr_eff_for_olla 提供 informed 初始估计, OLLA 在此基础上微调
+        # --- MCS 选择 (Sionna OLLA) ---
         est_re = np.full(num_ue, re_per_prb * max(num_prb // num_ue, 1), dtype=np.int32)
         mcs_indices = self.sionna_phy.select_mcs(
             num_allocated_re=est_re,
@@ -331,23 +353,38 @@ class SimulationEngine:
             scheduled_mask=self._last_scheduled_mask,
         )
 
-        # 5. 计算 per-PRB 可达速率 (Shannon 容量, 用于 PF metric)
+        # --- HARQ: 检查重传需求, 重传 UE 使用原始 MCS ---
+        has_retx = self.harq_mgr.has_any_retransmission()
+        retx_info = {}  # ue_id → retx_info dict
+        for ue in range(num_ue):
+            if has_retx[ue]:
+                info = self.harq_mgr.get_retx_info(ue)
+                if info is not None:
+                    retx_info[ue] = info
+                    mcs_indices[ue] = info['mcs']  # 重传用原始 MCS
+
+        # --- 可达速率 (Shannon 容量) ---
         achievable_rate_per_prb = np.zeros((num_ue, num_prb))
         for ue in range(num_ue):
             r = int(ue_rank[ue])
             sinr_prb = channel_state.sinr_per_prb[ue, :r, :]
             capacity = np.sum(np.log2(1.0 + np.maximum(sinr_prb, 0)), axis=0)
-            achievable_rate_per_prb[ue, :] = capacity * re_per_prb
+            # 重传 UE 给予更高优先级 (capacity ×2)
+            boost = 2.0 if ue in retx_info else 1.0
+            achievable_rate_per_prb[ue, :] = capacity * re_per_prb * boost
 
-        # 6. PF 调度
+        # --- PF 调度 ---
         ue_buffer = np.array([ue.buffer_bytes for ue in self.ue_states])
+        # 重传 UE 也需要有 buffer (即使已传数据还没 ACK)
+        for ue in retx_info:
+            ue_buffer[ue] = max(ue_buffer[ue], retx_info[ue]['tbs'] // 8)
         sched = self.scheduler.schedule(
             slot_ctx, self.ue_states, channel_state,
             achievable_rate_per_prb, ue_buffer,
             mcs_indices, ue_rank
         )
 
-        # 7. PHY 评估 (Sionna: EESM + BLER 查表 + HARQ 判定)
+        # --- PHY 评估 ---
         ue_num_re = sched.ue_num_prbs * re_per_prb
         phy_results = self.sionna_phy.evaluate(
             mcs_indices=mcs_indices,
@@ -356,7 +393,43 @@ class SimulationEngine:
             prb_assignment=sched.prb_assignment,
         )
 
-        # 8. 更新状态
+        # --- HARQ 反馈处理 ---
+        final_decoded_bits = phy_results['decoded_bits'].copy()
+        for ue in range(num_ue):
+            is_scheduled = sched.ue_num_prbs[ue] > 0
+            is_success = bool(phy_results['is_success'][ue])
+            sinr_linear = float(phy_results['sinr_eff'][ue])
+
+            if ue in retx_info:
+                # 重传 UE: Chase Combining (累积 SINR)
+                pid = retx_info[ue]['process_id']
+                combined_sinr = self.harq_mgr.get_combining_sinr(ue, pid, sinr_linear)
+                # 如果 combining 后 SINR 提升, 重新判定成功
+                # 简化: combining 增益 ~3dB → 成功率提升
+                if not is_success and combined_sinr > sinr_linear * 1.5:
+                    is_success = True  # combining 增益使重传成功
+                fb = self.harq_mgr.process_feedback(ue, pid, is_success, sinr_linear)
+                final_decoded_bits[ue] = fb['decoded_bits']
+            elif is_scheduled:
+                # 新传输: 注册 HARQ 进程
+                tbs = int(sched.ue_tbs_bits[ue])
+                if tbs > 0:
+                    pid = self.harq_mgr.start_new_tx(
+                        ue, int(mcs_indices[ue]), int(sched.ue_num_prbs[ue]),
+                        int(ue_rank[ue]), tbs, slot_idx
+                    )
+                    if pid >= 0:
+                        self._active_harq_pid[ue] = pid
+                        if not is_success:
+                            # NACK: 加入重传队列
+                            self.harq_mgr.process_feedback(ue, pid, False, sinr_linear)
+                            final_decoded_bits[ue] = 0
+                        else:
+                            self.harq_mgr.process_feedback(ue, pid, True, sinr_linear)
+
+        phy_results['decoded_bits'] = final_decoded_bits
+
+        # --- 更新状态 ---
         self._last_harq = phy_results['harq_feedback'].copy()
         self._last_sinr_eff = phy_results['sinr_eff'].copy()
         self._last_scheduled_mask = sched.ue_num_prbs > 0

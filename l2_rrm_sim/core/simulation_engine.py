@@ -183,7 +183,7 @@ class SimulationEngine:
 
         for slot_idx in range(num_slots):
             slot_result = self.run_slot(slot_idx)
-            self.kpi.collect(slot_idx, slot_result)
+            self.kpi.collect(slot_idx, slot_result, self._buf_after_traffic)
 
             if (slot_idx + 1) % 1000 == 0 or slot_idx == num_slots - 1:
                 elapsed = time.time() - t_start
@@ -208,6 +208,11 @@ class SimulationEngine:
 
         # 1. 流量生成
         self.traffic.generate(slot_ctx, self.ue_states)
+
+        # 记录流量生成后的 buffer 状态 (体验速率计算用)
+        self._buf_after_traffic = np.array(
+            [ue.buffer_bytes for ue in self.ue_states], dtype=np.int64
+        )
 
         # 2. 信道更新
         channel_state = self.channel.update(slot_ctx, self.ue_states)

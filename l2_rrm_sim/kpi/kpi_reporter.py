@@ -54,25 +54,32 @@ class KPIReporter:
         ue_avg_tp_mbps = ue_avg_bits_per_slot / slot_duration_s / 1e6
 
         # ============================================================
-        # 体验速率 (User Experienced Data Rate)
+        # 掐头去尾体验速率 (Session-based Experienced Rate)
         # ============================================================
-        # 1. 小区体验速率: UE 平均吞吐量的掐头去尾均值
-        cell_experienced_rate_mbps = self._trimmed_mean(ue_avg_tp_mbps, self.trim_percent)
+        from .experienced_rate import ExperiencedRateCalculator
+        exp_calc = ExperiencedRateCalculator(c.num_ue, slot_duration_s)
 
-        # 2. 每 UE 体验速率: 每 UE 时间维度的掐头去尾均值
-        ue_experienced_tp_mbps = np.zeros(c.num_ue)
-        for ue in range(c.num_ue):
-            ue_slot_tp = ue_bits[:, ue] / slot_duration_s / 1e6
-            # 只统计被调度的 slot
-            ue_sched_slots = scheduled_mask[:, ue]
-            if np.sum(ue_sched_slots) > 0:
-                scheduled_tp = ue_slot_tp[ue_sched_slots]
-                ue_experienced_tp_mbps[ue] = self._trimmed_mean(scheduled_tp, self.trim_percent)
-            else:
-                ue_experienced_tp_mbps[ue] = 0.0
+        # 逐 slot 重建 session 状态
+        buf_data = c.ue_buffer_bytes[s]          # (valid_slots, num_ue)
+        bits_data = c.ue_throughput_bits[s]
+        prbs_data = c.ue_num_prbs[s]
 
-        # 3. 小区边缘体验速率: 5th percentile
+        for t_idx in range(num_valid):
+            slot_abs = s.start + t_idx
+            buf_before = buf_data[t_idx]
+            decoded = bits_data[t_idx]
+            num_prbs_t = prbs_data[t_idx]
+            # buffer after = buffer before - decoded bytes (近似)
+            buf_after = np.maximum(buf_before - decoded // 8, 0)
+            exp_calc.process_slot(slot_abs, buf_before, decoded, num_prbs_t, buf_after)
+
+        exp_result = exp_calc.compute_experienced_rate()
+        cell_experienced_rate_mbps = exp_result['cell_experienced_rate_mbps']
+        ue_experienced_tp_mbps = exp_result['ue_experienced_rate_mbps']
+
+        # 小区边缘: 5th percentile of UE average throughput
         cell_edge_tp_mbps = float(np.percentile(ue_avg_tp_mbps, 5))
+        cell_edge_exp_rate = exp_result['cell_edge_experienced_rate_mbps']
 
         # ============================================================
         # BLER
@@ -129,12 +136,14 @@ class KPIReporter:
             # 小区级
             'cell_avg_throughput_mbps': cell_avg_throughput_mbps,
             'cell_edge_throughput_mbps': cell_edge_tp_mbps,
-            'cell_experienced_rate_mbps': cell_experienced_rate_mbps,
             'spectral_efficiency_bps_hz': spectral_eff,
+            # 掐头去尾体验速率
+            'cell_experienced_rate_mbps': cell_experienced_rate_mbps,
+            'cell_edge_experienced_rate_mbps': cell_edge_exp_rate,
+            'ue_experienced_rate_mbps': ue_experienced_tp_mbps,
+            'experienced_rate_detail': exp_result,
             # 用户级
             'ue_avg_throughput_mbps': ue_avg_tp_mbps,
-            'ue_experienced_throughput_mbps': ue_experienced_tp_mbps,
-            'ue_trimmed_throughput_mbps': cell_experienced_rate_mbps,
             # BLER
             'avg_bler': avg_bler,
             'bler_per_ue': actual_bler_per_ue,
@@ -175,9 +184,12 @@ class KPIReporter:
     def _empty_report(self) -> dict:
         return {
             'cell_avg_throughput_mbps': 0, 'cell_edge_throughput_mbps': 0,
-            'cell_experienced_rate_mbps': 0, 'spectral_efficiency_bps_hz': 0,
-            'ue_avg_throughput_mbps': np.array([]), 'ue_experienced_throughput_mbps': np.array([]),
-            'ue_trimmed_throughput_mbps': 0, 'avg_bler': 0, 'bler_per_ue': np.array([]),
+            'cell_experienced_rate_mbps': 0, 'cell_edge_experienced_rate_mbps': 0,
+            'spectral_efficiency_bps_hz': 0,
+            'ue_avg_throughput_mbps': np.array([]),
+            'ue_experienced_rate_mbps': np.array([]),
+            'experienced_rate_detail': {},
+            'avg_bler': 0, 'bler_per_ue': np.array([]),
             'avg_mcs': 0, 'mcs_distribution': {}, 'avg_sinr_db': 0,
             'jain_fairness': 0, 'avg_scheduling_ratio': 0,
             'ue_scheduling_ratio': np.array([]), 'prb_utilization': 0,
@@ -196,9 +208,24 @@ class KPIReporter:
         print(f"    频谱效率:         {report['spectral_efficiency_bps_hz']:.2f} bps/Hz")
         print(f"    PRB 利用率:       {report['prb_utilization']*100:.1f}%")
         print("-" * 65)
-        print("  [体验速率]")
-        print(f"    小区体验速率 (掐头去尾): {report['cell_experienced_rate_mbps']:.2f} Mbps")
-        print(f"    小区边缘体验速率 (5%ile): {report['cell_edge_throughput_mbps']:.2f} Mbps")
+        print("  [掐头去尾体验速率]")
+        exp_detail = report.get('experienced_rate_detail', {})
+        n_sessions = exp_detail.get('total_valid_sessions', 0)
+        print(f"    有效 sessions:    {n_sessions}")
+        print(f"    小区体验速率:     {report['cell_experienced_rate_mbps']:.2f} Mbps")
+        print(f"    小区边缘体验速率: {report.get('cell_edge_experienced_rate_mbps', 0):.2f} Mbps")
+        if n_sessions > 0:
+            ue_exp = report['ue_experienced_rate_mbps']
+            active = ue_exp[exp_detail.get('num_sessions_per_ue', np.zeros(1)) > 0]
+            if len(active) > 0:
+                print(f"    UE 体验速率分布:  "
+                      f"Min={np.min(active):.1f}, 50%={np.median(active):.1f}, "
+                      f"Max={np.max(active):.1f} Mbps")
+            if exp_detail.get('session_details'):
+                waits = [s['wait_slots'] for s in exp_detail['session_details']]
+                print(f"    平均等待调度:     {np.mean(waits):.1f} slots")
+        elif report['cell_avg_throughput_mbps'] > 0:
+            print(f"    (Full Buffer 无 session 边界, 不适用)")
         print("-" * 65)
         print("  [链路质量]")
         print(f"    平均 BLER:        {report['avg_bler']:.4f} (目标 0.1)")
@@ -208,17 +235,12 @@ class KPIReporter:
         print("  [调度与公平性]")
         print(f"    Jain 公平指数:    {report['jain_fairness']:.4f}")
         print(f"    平均调度占比:     {report['avg_scheduling_ratio']*100:.1f}%")
+        print(f"    小区边缘吞吐(5%): {report['cell_edge_throughput_mbps']:.2f} Mbps")
         print("-" * 65)
         ue_tp = report['ue_avg_throughput_mbps']
         if len(ue_tp) > 0:
-            print("  [UE 吞吐量分布 (Mbps)]")
+            print("  [UE 平均吞吐量分布 (Mbps)]")
             print(f"    Min: {np.min(ue_tp):.2f},  5%: {np.percentile(ue_tp, 5):.2f}, "
                   f" 50%: {np.median(ue_tp):.2f},  95%: {np.percentile(ue_tp, 95):.2f}, "
                   f" Max: {np.max(ue_tp):.2f}")
-            ue_exp = report['ue_experienced_throughput_mbps']
-            if len(ue_exp) > 0:
-                print("  [UE 体验速率分布 (Mbps)]")
-                print(f"    Min: {np.min(ue_exp):.2f},  5%: {np.percentile(ue_exp, 5):.2f}, "
-                      f" 50%: {np.median(ue_exp):.2f},  95%: {np.percentile(ue_exp, 95):.2f}, "
-                      f" Max: {np.max(ue_exp):.2f}")
         print("=" * 65)

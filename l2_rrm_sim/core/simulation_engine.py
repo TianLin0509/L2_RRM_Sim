@@ -164,8 +164,8 @@ class SimulationEngine:
         # per-UE 的活跃 HARQ process ID (-1 = 无)
         self._active_harq_pid = np.full(self.num_ue, -1, dtype=np.int32)
 
-        # 流量模型
-        self.traffic = FullBufferTraffic()
+        # 流量模型 (按 TrafficConfig.type 实例化)
+        self.traffic = self._create_traffic_model()
         self.buffer_mgr = BufferManager(self.num_ue)
 
         # KPI
@@ -253,7 +253,8 @@ class SimulationEngine:
         print(f"=== 仿真完成 ({elapsed_total:.1f}s) ===\n")
 
         # 生成报告
-        reporter = KPIReporter(self.kpi, self.carrier_config)
+        reporter = KPIReporter(self.kpi, self.carrier_config,
+                               trim_percent=self.sim_config.kpi_trim_percent)
         report = reporter.report()
         reporter.print_report(report)
         return report
@@ -500,6 +501,12 @@ class SimulationEngine:
     def _finalize_slot(self, slot_ctx, phy_results, mcs_indices,
                        ue_rank, sinr_eff_db, sched):
         """slot 后续处理: 缓冲区更新, 调度器更新, 构造 SlotResult"""
+        # 截断 decoded_bits: 不能超过实际 buffer (非满缓冲场景)
+        for ue_idx, ue in enumerate(self.ue_states):
+            max_bits = ue.buffer_bytes * 8
+            if phy_results['decoded_bits'][ue_idx] > max_bits > 0:
+                phy_results['decoded_bits'][ue_idx] = max_bits
+
         # 更新缓冲区
         self.buffer_mgr.dequeue(self.ue_states, phy_results['decoded_bits'])
 
@@ -523,3 +530,27 @@ class SimulationEngine:
             ue_throughput_inst=throughput_inst,
             scheduling_decision=sched,
         )
+
+    def _create_traffic_model(self):
+        """按 TrafficConfig.type 创建流量模型"""
+        t = self.traffic_config.type.lower()
+        if t in ('ftp', 'ftp_model3', 'ftp3'):
+            from ..traffic.ftp_model import FTPModel3
+            return FTPModel3(
+                file_size_bytes=self.traffic_config.ftp_file_size_bytes,
+                arrival_rate=self.traffic_config.ftp_lambda,
+                slot_duration_s=self.carrier_config.slot_duration_s,
+                num_ue=self.num_ue,
+                rng=self.rng.traffic,
+            )
+        elif t in ('poisson', 'bursty'):
+            from ..traffic.bursty_traffic import PoissonTraffic
+            return PoissonTraffic(
+                packet_size_bytes=1500,
+                arrival_rate_pps=self.traffic_config.ftp_lambda * 1000,
+                slot_duration_s=self.carrier_config.slot_duration_s,
+                num_ue=self.num_ue,
+                rng=self.rng.traffic,
+            )
+        else:
+            return FullBufferTraffic()

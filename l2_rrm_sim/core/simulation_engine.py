@@ -361,10 +361,6 @@ class SimulationEngine:
         # 信道更新
         channel_state = self.channel.update(slot_ctx, self.ue_states)
         
-        # 为了兼容旧代码，如果 channel.update 返回的是旧的 channel_matrix，将其映射到 actual_channel_matrix
-        if hasattr(channel_state, 'channel_matrix') and channel_state.actual_channel_matrix is None:
-            channel_state.actual_channel_matrix = channel_state.channel_matrix
-            
         # 生成估计信道 (包含 LS 估计误差)
         channel_state.estimated_channel_matrix = self.channel_estimator.estimate(channel_state)
 
@@ -629,7 +625,8 @@ class SimulationEngine:
         # 更新状态
         self._last_harq_ack = phy_results['is_success'].copy()
         self._last_harq = np.where(phy_results['is_success'], 1, 0).astype(np.int32)
-        self._last_sinr_eff = np.ones(num_ue, dtype=np.float32)
+        from ..utils.math_utils import db_to_linear
+        self._last_sinr_eff = db_to_linear(sinr_eff_db).astype(np.float32)
         self._last_scheduled_mask = sched.ue_num_prbs > 0
 
         return self._finalize_slot(slot_ctx, phy_results, mcs_indices,

@@ -108,7 +108,7 @@ class RankAdapter:
             U, S, Vh = np.linalg.svd(channel_matrix[:, :, prb], full_matrices=False)
             for l in range(best_rank):
                 if l < len(S):
-                    precoder[:, l, prb] = Vh[l, :].conj()
+                    precoder[:, l, prb] = Vh[l, :].conj().T
                     sinr_per_layer[l, prb] = (
                         tx_power_per_prb * S[l]**2 / (best_rank * noise_power)
                     )

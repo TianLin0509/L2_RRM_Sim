@@ -277,7 +277,7 @@ class SimulationEngine:
         # 启动事件总线异步处理
         from ..kpi.event_bus import SimEvent
         self.event_bus.start()
-        self.event_bus.emit(SimEvent('sim_started', data=config if 'config' in dir() else None))
+        self.event_bus.emit(SimEvent('sim_started', data=None))
 
         for slot_idx in range(num_slots):
             slot_result = self.run_slot(slot_idx)
@@ -444,12 +444,12 @@ class SimulationEngine:
             scheduled_mask=self._last_scheduled_mask,
         )
 
-        # --- HARQ: 检查重传需求, 重传 UE 使用原始 MCS ---
+        # --- HARQ: 两阶段 peek → 调度 → consume，防止未调度 UE 的进程丢失 ---
         has_retx = self.harq_mgr.has_any_retransmission()
         retx_info = {}  # ue_id → retx_info dict
         for ue in range(num_ue):
             if has_retx[ue]:
-                info = self.harq_mgr.get_retx_info(ue)
+                info = self.harq_mgr.peek_retx_info(ue)  # 只读，不消费
                 if info is not None:
                     retx_info[ue] = info
                     mcs_indices[ue] = info['mcs']  # 重传用原始 MCS
@@ -473,6 +473,11 @@ class SimulationEngine:
             achievable_rate_per_prb, ue_buffer,
             mcs_indices, ue_rank
         )
+
+        # 调度完成后，消费已被调度的重传进程（未调度的保留在队列中）
+        for ue in retx_info:
+            if sched.ue_num_prbs[ue] > 0:
+                self.harq_mgr.consume_retx(ue)
         
         # --- L1 评估闭环: 计算 MU-MIMO 真实 SINR ---
         if sched.mu_groups is not None:

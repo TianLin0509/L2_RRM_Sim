@@ -116,14 +116,24 @@ class StatisticalChannel(ChannelModelBase):
         sqrt_loss = np.sqrt(total_loss_linear)[:, None, None, None]
         actual_channel_matrix = h_matrix / sqrt_loss
 
-        # Vectorized fading gain and SINR
-        fading_gain = np.abs(h_matrix[:, 0, 0, :]) ** 2
-        sinr_per_prb[:, 0, :] = (
-            self._tx_power_per_prb * fading_gain
-            / (total_loss_linear[:, None] * self._noise_power_per_prb)
+        # Batch SVD on actual_channel_matrix (already includes path loss).
+        # S already encodes channel gain after loss, so SINR = P * S² / (n_layers * N0).
+        H_batch = actual_channel_matrix.transpose(0, 3, 1, 2).reshape(
+            -1, num_rx_ant, num_tx_ant
+        )  # (num_ue*num_prb, num_rx, num_tx)
+        _, S_batch, _ = np.linalg.svd(H_batch, full_matrices=False)
+        # S_batch: (num_ue*num_prb, min(rx,tx))
+        num_sv = S_batch.shape[1]
+        S_all = S_batch.reshape(num_ue, num_prb, num_sv).transpose(0, 2, 1)
+        # S_all: (num_ue, num_sv, num_prb)
+
+        n_layers = min(max_layers, num_sv)
+        sinr_per_prb[:, :n_layers, :] = (
+            self._tx_power_per_prb * S_all[:, :n_layers, :] ** 2
+            / (n_layers * self._noise_power_per_prb)
         )
 
-        # Vectorized wideband SINR
+        # Wideband SINR based on layer-0 (reference layer)
         mean_sinr = np.mean(sinr_per_prb[:, 0, :], axis=1)
         wideband_sinr_db = linear_to_db(mean_sinr)
 

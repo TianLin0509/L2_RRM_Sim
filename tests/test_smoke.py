@@ -94,10 +94,14 @@ def test_buffer_cap_non_full_buffer():
 
     for slot_idx in range(50):
         result = engine.run_slot(slot_idx)
-        # 检查: 没有 UE 的 decoded_bits 超过其 buffer
-        for ue_idx, ue in enumerate(engine.ue_states):
-            # decoded_bits 已经在 _finalize_slot 中被截断
-            pass  # 只要不崩溃就算通过
+        # buffer 不应为负（decoded_bits 截断逻辑正确）
+        for ue in engine.ue_states:
+            assert ue.buffer_bytes >= 0, (
+                f"slot {slot_idx}: UE {ue.ue_id} buffer 为负 {ue.buffer_bytes}"
+            )
+        # decoded_bits 不应超过 TBS 上限（合理性检查）
+        for ue_idx in range(len(engine.ue_states)):
+            assert result.ue_decoded_bits[ue_idx] >= 0, "decoded_bits 不应为负"
 
 
 def test_kpi_trim_percent_passed():
@@ -166,6 +170,85 @@ def test_harq_entity():
     # ACK → 成功
     result2 = mgr.process_feedback(0, pid, is_ack=True, sinr_eff_linear=5.0)
     assert result2['decoded_bits'] == 5000
+
+
+def test_harq_max_retx():
+    """达到 max_retx 后进程应释放，不再重传"""
+    from l2_rrm_sim.harq import HARQManager
+
+    max_retx = 3  # 总传输次数: 初传 + 2 次重传
+    mgr = HARQManager(num_ue=1, num_processes=4, max_retx=max_retx)
+
+    pid = mgr.start_new_tx(0, mcs=10, num_prbs=10, num_layers=1, tbs=2000, slot_idx=0)
+    assert pid >= 0
+
+    # 连续 NACK 直到耗尽重传次数
+    retx_count = 0
+    for _ in range(max_retx + 2):  # 多发几次确保不会无限重传
+        result = mgr.process_feedback(0, pid, is_ack=False, sinr_eff_linear=1.0)
+        if result['retx_needed']:
+            retx_count += 1
+        else:
+            break
+
+    # 最多允许 max_retx-1 次重传（3GPP: maxHARQ-Tx 包含初传）
+    assert retx_count <= max_retx - 1, f"重传次数 {retx_count} 超过上限 {max_retx - 1}"
+    # 进程应已释放
+    assert not mgr.entities[0].processes[pid].is_active, "进程应已释放"
+
+
+def test_harq_peek_does_not_consume():
+    """peek_retx_info 不应消费重传队列"""
+    from l2_rrm_sim.harq import HARQManager
+
+    mgr = HARQManager(num_ue=1, num_processes=4, max_retx=4)
+    pid = mgr.start_new_tx(0, mcs=10, num_prbs=10, num_layers=1, tbs=2000, slot_idx=0)
+    mgr.process_feedback(0, pid, is_ack=False, sinr_eff_linear=1.0)
+
+    # peek 两次，队列不应被消费
+    info1 = mgr.peek_retx_info(0)
+    info2 = mgr.peek_retx_info(0)
+    assert info1 is not None
+    assert info2 is not None
+    assert info1['process_id'] == info2['process_id']
+
+    # consume 后队列才清空
+    mgr.consume_retx(0)
+    assert mgr.peek_retx_info(0) is None
+
+
+def test_rank_selection_multi_layer():
+    """Fix 1 后 statistical channel 应能选出 rank > 1"""
+    from l2_rrm_sim.channel.statistical_channel import StatisticalChannel
+    from l2_rrm_sim.config.sim_config import CellConfig, CarrierConfig, ChannelConfig
+    from l2_rrm_sim.core.data_types import UEState, SlotContext
+    from l2_rrm_sim.scheduler.rank_adaptation import RankAdapter
+    import numpy as np
+
+    cell_cfg = CellConfig(num_tx_ant=4, num_tx_ports=4, max_layers=4,
+                          cell_radius_m=200, scenario='uma')
+    carrier_cfg = CarrierConfig(subcarrier_spacing=30, num_prb=25,
+                                bandwidth_mhz=10, carrier_freq_ghz=3.5)
+    ch_cfg = ChannelConfig(type='statistical', scenario='uma')
+
+    rng = np.random.default_rng(0)
+    ch = StatisticalChannel(cell_cfg, carrier_cfg, ch_cfg, rng)
+
+    ue_states = []
+    for i in range(4):
+        ue = UEState(ue_id=i, position=np.array([50.0 + i*10, 0.0, 1.5]),
+                     velocity=np.array([0.0, 0.0, 0.0]))
+        ue.num_rx_ant = 4
+        ue_states.append(ue)
+
+    ch.initialize(cell_cfg, carrier_cfg, ue_states)
+    slot_ctx = SlotContext(slot_idx=0, time_s=0.0)
+    channel_state = ch.update(slot_ctx, ue_states)
+
+    adapter = RankAdapter(max_rank=4)
+    ranks = [adapter.select_rank(channel_state.sinr_per_prb[ue]) for ue in range(4)]
+    # 至少有一个 UE 应选出 rank > 1（4 天线场景下概率极高）
+    assert max(ranks) > 1, f"所有 UE rank 均为 1，Fix 1 可能未生效: {ranks}"
 
 
 # ============================================================

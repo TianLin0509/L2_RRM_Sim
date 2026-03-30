@@ -36,8 +36,42 @@ class HARQManager:
         """(num_ue,) bool: 各 UE 是否有待重传"""
         return np.array([e.has_retransmission() for e in self.entities])
 
+    def peek_retx_info(self, ue_id: int) -> dict:
+        """查看 UE 的重传信息（只读，不消费队列）
+
+        Returns:
+            dict: {has_retx, mcs, num_prbs, num_layers, tbs, process_id}
+            或 None
+        """
+        entity = self.entities[ue_id]
+        # 只读队列头，不 pop
+        while entity._retx_queue:
+            pid = entity._retx_queue[0]
+            proc = entity.processes[pid]
+            if proc.is_active:
+                return {
+                    'has_retx': True,
+                    'process_id': proc.process_id,
+                    'mcs': proc.mcs_index,
+                    'num_prbs': proc.num_prbs,
+                    'num_layers': proc.num_layers,
+                    'tbs': proc.tbs_bits,
+                    'rv': proc.rv,
+                    'num_retx': proc.num_retx,
+                    'accumulated_sinr': proc.accumulated_sinr,
+                }
+            else:
+                # 进程已失效，清理并继续
+                entity._retx_queue.pop(0)
+        return None
+
+    def consume_retx(self, ue_id: int):
+        """消费重传队列头（调度确认后调用）"""
+        entity = self.entities[ue_id]
+        entity.get_next_retx_process()  # pop 并丢弃返回值（已通过 peek 获取信息）
+
     def get_retx_info(self, ue_id: int) -> dict:
-        """获取 UE 的重传信息
+        """获取 UE 的重传信息并消费队列（兼容旧接口）
 
         Returns:
             dict: {has_retx, mcs, num_prbs, num_layers, tbs, process_id}

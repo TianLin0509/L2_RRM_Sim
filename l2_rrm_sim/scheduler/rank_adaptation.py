@@ -36,9 +36,7 @@ class RankAdapter:
 
         for r in range(1, available_layers + 1):
             mean_sinr_per_layer = np.mean(sinr_per_prb[:r, :], axis=1)
-            # SINR 随 rank 增加会衰减 (简化: 除以 rank 模拟功率分摊)
-            adjusted_sinr = mean_sinr_per_layer / r
-            se = np.sum(np.log2(1.0 + np.maximum(adjusted_sinr, 0)))
+            se = np.sum(np.log2(1.0 + np.maximum(mean_sinr_per_layer, 0)))
             if se > best_se:
                 best_se = se
                 best_rank = r

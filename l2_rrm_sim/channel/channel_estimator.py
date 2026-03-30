@@ -49,8 +49,7 @@ class ChannelEstimator:
 
         h_actual = channel_state.actual_channel_matrix
 
-        # Use real part mean for faster noise_std computation
-        noise_std = self.estimation_error_std * np.mean(np.abs(h_actual.real))
+        noise_std = self.estimation_error_std * np.mean(np.abs(h_actual))
 
         # Noise pool: generate or regenerate when exhausted or shape changed
         if (self._noise_pool is None

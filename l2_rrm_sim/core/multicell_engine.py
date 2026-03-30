@@ -222,8 +222,8 @@ class MultiCellSimulationEngine:
 
             # 每小区独立处理
             for cell_idx in range(self.num_cells):
-                result = self._run_cell_slot(cell_idx, slot_ctx, pl_func)
-                self.cell_kpis[cell_idx].collect(slot_idx, result)
+                result, buf_before, buf_after = self._run_cell_slot(cell_idx, slot_ctx, pl_func)
+                self.cell_kpis[cell_idx].collect(slot_idx, result, buf_before, buf_after)
 
             if (slot_idx + 1) % 1000 == 0 or slot_idx == num_slots - 1:
                 elapsed = time.time() - t_start
@@ -247,6 +247,7 @@ class MultiCellSimulationEngine:
 
         # 流量
         self.traffic.generate(slot_ctx, ue_states)
+        buf_before_tx = np.array([u.buffer_bytes for u in ue_states], dtype=np.int64)
 
         # 信道 + 干扰 → SINR
         sinr_per_prb = np.zeros((num_ue, self.cell_config.max_layers, num_prb))
@@ -339,6 +340,7 @@ class MultiCellSimulationEngine:
         for ue_idx, ue in enumerate(ue_states):
             tx_bytes = int(phy_results['decoded_bits'][ue_idx]) // 8
             ue.buffer_bytes = max(0, ue.buffer_bytes - tx_bytes)
+        buf_after_tx = np.array([u.buffer_bytes for u in ue_states], dtype=np.int64)
 
         sinr_eff_db = np.zeros(num_ue)
         if 'sinr_eff' in phy_results and phy_results['sinr_eff'] is not None:
@@ -356,7 +358,7 @@ class MultiCellSimulationEngine:
             ue_sinr_eff_db=sinr_eff_db,
             ue_throughput_inst=phy_results['decoded_bits'].astype(float) / slot_duration_s,
             scheduling_decision=sched,
-        )
+        ), buf_before_tx, buf_after_tx
 
     def _aggregate_report(self) -> dict:
         """汇总所有小区 KPI"""

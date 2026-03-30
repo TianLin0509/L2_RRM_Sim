@@ -176,7 +176,7 @@ class CSIFeedbackManager:
             # 等功率分配: 每层 P/r
             capacity = 0.0
             for l in range(r):
-                sinr_l = tx_power * num_prb * S[l]**2 / (r * self.noise_power_per_prb * num_prb)
+                sinr_l = tx_power * S[l]**2 / (r * self.noise_power_per_prb)
                 capacity += np.log2(1.0 + max(sinr_l, 0))
 
             if capacity > best_capacity:

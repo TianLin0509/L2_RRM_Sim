@@ -84,9 +84,10 @@ class SRSManager:
             latest_ready = max(ready_slots)
             self.h_srs_buffer = self._measurement_queue.pop(latest_ready)
             self._buffer_initialized = True
-            # 清理旧数据
+            # 清理其他已过期的 slot（latest_ready 已被 pop，跳过它）
             for s in ready_slots:
-                self._measurement_queue.pop(s, None)
+                if s != latest_ready:
+                    self._measurement_queue.pop(s, None)
 
         if not self._buffer_initialized:
             return None  # 调用方会回退到 LS 估计

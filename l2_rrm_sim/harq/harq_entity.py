@@ -158,7 +158,7 @@ class HARQEntity:
                     'retx_needed': False}
         else:
             self.total_nacks += 1
-            if proc.num_retx >= self.max_retx:
+            if proc.num_retx >= self.max_retx - 1:
                 # 达到最大重传次数，放弃
                 self.total_max_retx_reached += 1
                 proc.release()

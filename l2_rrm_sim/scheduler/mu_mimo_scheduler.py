@@ -101,21 +101,23 @@ class MUMIMOPFScheduler(SchedulerBase):
                 if prb_assignment[prb] >= 0:
                     mu_mimo_groups[prb] = [int(prb_assignment[prb])]
 
-        # 统计每 UE 的分配
+        # 统计每 UE 的分配（向量化）
         ue_num_prbs = np.zeros(num_ue, dtype=np.int32)
-        ue_effective_rank = np.ones(num_ue, dtype=np.int32)
+        ue_effective_rank = ue_rank.copy().astype(np.int32)
+        group_sizes = np.array([len(g) for g in mu_mimo_groups], dtype=np.int32)
 
         for prb in range(num_prb):
             for ue in mu_mimo_groups[prb]:
                 ue_num_prbs[ue] += 1
 
-        # MU-MIMO 时，每 UE 的有效 rank = 1
-        for ue in range(num_ue):
-            if ue_num_prbs[ue] > 0:
-                is_mu = any(len(mu_mimo_groups[prb]) > 1
-                            for prb in range(num_prb)
-                            if ue in mu_mimo_groups[prb])
-                ue_effective_rank[ue] = 1 if is_mu else int(ue_rank[ue])
+        # MU-MIMO 时，有效 rank = 1（向量化：找出出现在 size>1 组中的 UE）
+        mu_prbs = np.where(group_sizes > 1)[0]
+        if mu_prbs.size > 0:
+            mu_ue_set = set()
+            for prb in mu_prbs:
+                mu_ue_set.update(mu_mimo_groups[prb])
+            for ue in mu_ue_set:
+                ue_effective_rank[ue] = 1
 
         # 计算 TBS
         ue_tbs = np.zeros(num_ue, dtype=np.int64)

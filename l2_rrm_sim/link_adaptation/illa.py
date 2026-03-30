@@ -24,10 +24,34 @@ class ILLA:
         self.mcs_table_index = mcs_table_index
         self.num_re_per_prb = num_re_per_prb
 
+    def _compute_tbler(self, mcs: int, sinr_eff_db: float,
+                       num_allocated_prbs: int, num_layers: int) -> float:
+        """Compute TBLER for a given MCS. Returns 2.0 if MCS is invalid."""
+        tbs = compute_tbs(
+            self.num_re_per_prb, num_allocated_prbs,
+            mcs, num_layers, self.mcs_table_index
+        )
+        if tbs <= 0:
+            return 2.0
+
+        from .mcs_tables import get_mcs_params
+        _, rate_x1024 = get_mcs_params(mcs, self.mcs_table_index)
+        r = rate_x1024 / 1024.0
+        num_cb, cbs = compute_num_code_blocks(tbs, r)
+        if cbs <= 0:
+            return 2.0
+
+        bler = self.bler_table.lookup_bler(
+            sinr_eff_db, mcs, cbs, self.mcs_table_index
+        )
+        if num_cb > 1:
+            return 1.0 - (1.0 - bler) ** num_cb
+        return bler
+
     def select_mcs(self, sinr_eff_db: float,
                    num_allocated_prbs: int = 1,
                    num_layers: int = 1) -> int:
-        """选择最优 MCS
+        """选择最优 MCS (binary search)
 
         Args:
             sinr_eff_db: 有效 SINR (dB)
@@ -39,36 +63,16 @@ class ILLA:
         """
         max_mcs = get_max_mcs_index(self.mcs_table_index)
 
-        # 从高到低遍历 MCS
-        for mcs in range(max_mcs, -1, -1):
-            # 计算 TBS 和 CBS
-            tbs = compute_tbs(
-                self.num_re_per_prb, num_allocated_prbs,
-                mcs, num_layers, self.mcs_table_index
-            )
-            if tbs <= 0:
-                continue
-
-            from .mcs_tables import get_mcs_params
-            _, rate_x1024 = get_mcs_params(mcs, self.mcs_table_index)
-            r = rate_x1024 / 1024.0
-            num_cb, cbs = compute_num_code_blocks(tbs, r)
-            if cbs <= 0:
-                continue
-
-            # 查询 BLER
-            bler = self.bler_table.lookup_bler(
-                sinr_eff_db, mcs, cbs, self.mcs_table_index
-            )
-
-            # 计算 TBLER
-            if num_cb > 1:
-                tbler = 1.0 - (1.0 - bler) ** num_cb
-            else:
-                tbler = bler
-
+        # Binary search: find highest MCS with TBLER <= target
+        lo, hi = 0, max_mcs
+        best = 0
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            tbler = self._compute_tbler(mid, sinr_eff_db, num_allocated_prbs, num_layers)
             if tbler <= self.bler_target:
-                return mcs
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
 
-        # 没有 MCS 满足目标，返回最低 MCS
-        return 0
+        return best

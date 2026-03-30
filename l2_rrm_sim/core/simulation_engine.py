@@ -596,13 +596,17 @@ class SimulationEngine:
             )
         mcs_indices = self.olla.select_mcs(sinr_eff_db, est_prbs, ue_rank)
 
-        # Achievable rate
-        achievable_rate_per_prb = np.zeros((num_ue, num_prb))
-        for ue in range(num_ue):
-            r = int(ue_rank[ue])
-            sinr_prb = channel_state.sinr_per_prb[ue, :r, :]
-            capacity = np.sum(np.log2(1.0 + np.maximum(sinr_prb, 0)), axis=0)
-            achievable_rate_per_prb[ue, :] = capacity * re_per_prb
+        # Achievable rate (rank=1 fast path)
+        if np.all(ue_rank == 1):
+            sinr_r1 = channel_state.sinr_per_prb[:, 0, :]
+            achievable_rate_per_prb = np.log2(1.0 + np.maximum(sinr_r1, 0)) * re_per_prb
+        else:
+            achievable_rate_per_prb = np.zeros((num_ue, num_prb))
+            for ue in range(num_ue):
+                r = int(ue_rank[ue])
+                sinr_prb = channel_state.sinr_per_prb[ue, :r, :]
+                capacity = np.sum(np.log2(1.0 + np.maximum(sinr_prb, 0)), axis=0)
+                achievable_rate_per_prb[ue, :] = capacity * re_per_prb
 
         # PF 调度
         ue_buffer = np.array([ue.buffer_bytes for ue in self.ue_states])

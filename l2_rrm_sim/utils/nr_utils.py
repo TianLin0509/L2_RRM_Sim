@@ -4,6 +4,8 @@ TBS 计算: TS 38.214 Section 5.1.3.2
 RE 计算: TS 38.214 Section 5.1.3.2
 """
 
+import math as _math
+from functools import lru_cache
 import numpy as np
 from ..core.nr_constants import (
     MCS_TABLES, TBS_TABLE_SMALL, NUM_SC_PER_PRB, NUM_SYMBOLS_PER_SLOT
@@ -62,6 +64,7 @@ def compute_num_re_per_prb(num_pdcch_symbols: int = 2,
     return min(156, n_re_prime)
 
 
+@lru_cache(maxsize=4096)
 def compute_tbs(num_re_per_prb: int, num_prbs: int,
                 mcs_index: int, num_layers: int,
                 mcs_table_index: int = 1) -> int:
@@ -91,8 +94,8 @@ def compute_tbs(num_re_per_prb: int, num_prbs: int,
 
     if n_info <= 3824:
         # Step 3: 量化
-        n = max(3, int(np.floor(np.log2(n_info))) - 6)
-        n_info_prime = max(24, int(2**n * np.floor(n_info / 2**n)))
+        n = max(3, _math.floor(_math.log2(n_info)) - 6)
+        n_info_prime = max(24, int(2**n * _math.floor(n_info / 2**n)))
         # 从小 TBS 表查找最近的 >= n_info_prime 的 TBS
         idx = np.searchsorted(TBS_TABLE_SMALL, n_info_prime)
         if idx >= len(TBS_TABLE_SMALL):
@@ -100,22 +103,23 @@ def compute_tbs(num_re_per_prb: int, num_prbs: int,
         tbs = int(TBS_TABLE_SMALL[idx])
     else:
         # Step 4: N_info > 3824
-        n = int(np.floor(np.log2(n_info - 24))) - 5
-        n_info_prime = max(3840, int(2**n * np.round((n_info - 24) / 2**n)))
+        n = _math.floor(_math.log2(n_info - 24)) - 5
+        n_info_prime = max(3840, int(2**n * round((n_info - 24) / 2**n)))
 
         if r <= 0.25:
-            c = int(np.ceil((n_info_prime + 24) / 3816))
-            tbs = 8 * c * int(np.ceil((n_info_prime + 24) / (8 * c))) - 24
+            c = _math.ceil((n_info_prime + 24) / 3816)
+            tbs = 8 * c * _math.ceil((n_info_prime + 24) / (8 * c)) - 24
         else:
             if n_info_prime + 24 > 8424:
-                c = int(np.ceil((n_info_prime + 24) / 8424))
-                tbs = 8 * c * int(np.ceil((n_info_prime + 24) / (8 * c))) - 24
+                c = _math.ceil((n_info_prime + 24) / 8424)
+                tbs = 8 * c * _math.ceil((n_info_prime + 24) / (8 * c)) - 24
             else:
-                tbs = 8 * int(np.ceil((n_info_prime + 24) / 8)) - 24
+                tbs = 8 * _math.ceil((n_info_prime + 24) / 8) - 24
 
     return tbs
 
 
+@lru_cache(maxsize=4096)
 def compute_num_code_blocks(tbs: int, r: float) -> tuple:
     """计算码块数和码块大小 (简化版)
 
@@ -144,7 +148,7 @@ def compute_num_code_blocks(tbs: int, r: float) -> tuple:
         cbs = b
     else:
         # 每个CB加24bit CRC24B
-        num_cb = int(np.ceil(b / (k_cb_max - 24)))
-        cbs = int(np.ceil(b / num_cb)) + 24  # 近似
+        num_cb = _math.ceil(b / (k_cb_max - 24))
+        cbs = _math.ceil(b / num_cb) + 24  # 近似
 
     return num_cb, min(cbs, k_cb_max)

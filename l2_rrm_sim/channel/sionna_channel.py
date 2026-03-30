@@ -223,46 +223,43 @@ class SionnaChannel(ChannelModelBase):
         channel_matrix = np.zeros((num_ue, self._num_rx_ant,
                                    self._num_tx_ant, num_prb), dtype=complex)
 
-        for ue in range(num_ue):
-            h_ue = h_np[ue]  # (rx_ant, tx_ant, num_sc)
+        # Vectorized PRB aggregation: reshape subcarriers into PRB groups and mean
+        num_rx = h_np.shape[1]
+        num_tx = h_np.shape[2]
+        # h_np: (num_ue, rx_ant, tx_ant, num_sc)
+        # Truncate to exact PRB boundary
+        num_sc_used = num_prb * NUM_SC_PER_PRB
+        h_trim = h_np[:, :, :, :num_sc_used]
+        h_prb_all = h_trim.reshape(num_ue, num_rx, num_tx, num_prb, NUM_SC_PER_PRB).mean(axis=4)
+        # h_prb_all: (num_ue, rx_ant, tx_ant, num_prb)
 
-            # 按 PRB 聚合 (每 PRB 12 子载波取平均功率)
-            h_prb = np.zeros((h_ue.shape[0], h_ue.shape[1], num_prb), dtype=complex)
-            for prb in range(num_prb):
-                sc_start = prb * NUM_SC_PER_PRB
-                sc_end = sc_start + NUM_SC_PER_PRB
-                h_prb[:, :, prb] = np.mean(h_ue[:, :, sc_start:sc_end], axis=2)
+        channel_matrix[:, :num_rx, :num_tx, :] = h_prb_all
 
-            channel_matrix[ue, :h_ue.shape[0], :h_ue.shape[1], :] = h_prb
+        # Batch SVD: reshape to (num_ue * num_prb, rx_ant, tx_ant)
+        h_svd = h_prb_all.transpose(0, 3, 1, 2).reshape(-1, num_rx, num_tx)
+        try:
+            _, S_all, _ = np.linalg.svd(h_svd, full_matrices=False)
+            # S_all: (num_ue * num_prb, min(rx, tx))
+            S_all = S_all.reshape(num_ue, num_prb, -1)
+            noise = self._noise_power_per_sc * NUM_SC_PER_PRB
+            n_layers = min(max_layers, S_all.shape[2])
+            for l in range(n_layers):
+                sinr_per_prb[:, l, :] = (
+                    self._tx_power_per_prb * S_all[:, :, l] ** 2
+                    / (n_layers * noise)
+                )
+        except np.linalg.LinAlgError:
+            pass  # leave sinr_per_prb as zeros
 
-            # SVD per PRB 计算 per-layer SINR
-            # 对每个 PRB: H[rx, tx] → SVD → 奇异值 → SINR
-            for prb in range(num_prb):
-                H = h_prb[:, :, prb]  # (rx_ant, tx_ant)
-                try:
-                    U, S, Vh = np.linalg.svd(H, full_matrices=False)
-                except np.linalg.LinAlgError:
-                    continue
+        # Vectorized pathloss
+        avg_gain = np.mean(np.sum(np.abs(h_prb_all[:, 0, :, :]) ** 2, axis=1), axis=1)
+        valid_gain = avg_gain > 0
+        pathloss_db[valid_gain] = -linear_to_db(avg_gain[valid_gain])
+        pathloss_db[~valid_gain] = 150.0
 
-                # 每 layer 的 SINR: P_tx × sigma_l^2 / (num_layers × N_0)
-                # 等功率分配到各层
-                n_layers = min(max_layers, len(S))
-                noise = self._noise_power_per_sc * NUM_SC_PER_PRB  # PRB 噪声
-                for l in range(n_layers):
-                    signal = self._tx_power_per_prb * S[l]**2
-                    sinr_per_prb[ue, l, prb] = signal / (n_layers * noise)
-
-            # 路径损耗 (从信道能量反推)
-            avg_gain = np.mean(np.sum(np.abs(h_prb[0, :, :])**2, axis=0))
-            if avg_gain > 0:
-                # PL = P_tx / (P_rx / gain_antenna) 近似
-                pathloss_db[ue] = -linear_to_db(avg_gain)
-            else:
-                pathloss_db[ue] = 150.0
-
-            # 宽带 SINR
-            mean_sinr = np.mean(sinr_per_prb[ue, 0, :])
-            wideband_sinr_db[ue] = linear_to_db(mean_sinr) if mean_sinr > 0 else -30.0
+        # Vectorized wideband SINR
+        mean_sinr = np.mean(sinr_per_prb[:, 0, :], axis=1)
+        wideband_sinr_db = np.where(mean_sinr > 0, linear_to_db(mean_sinr), -30.0)
 
         return ChannelState(
             pathloss_db=pathloss_db,

@@ -58,17 +58,20 @@ class EESM:
         Returns:
             有效 SINR (dB)
         """
-        sinr = np.asarray(sinr_linear, dtype=np.float64).ravel()
-        # 只用有效的 SINR 值
-        valid = sinr > 0
-        if not np.any(valid):
-            return sinr_min_db
+        sinr = sinr_linear.ravel()
 
-        sinr_valid = sinr[valid]
+        # Fast path: check min to avoid unnecessary masking
+        min_val = sinr.min()
+        if min_val <= 0:
+            valid = sinr > 0
+            if not np.any(valid):
+                return sinr_min_db
+            sinr = sinr[valid]
+
         beta = self.get_beta(mcs_index, table_index)
 
         # EESM: SINR_eff = -β × ln( mean( exp(-SINR_i / β) ) )
-        exponents = -sinr_valid / beta
+        exponents = sinr / (-beta)
         # 数值稳定: 使用 logsumexp 技巧
         max_exp = np.max(exponents)
         log_mean = max_exp + np.log(np.mean(np.exp(exponents - max_exp)))
@@ -76,4 +79,8 @@ class EESM:
 
         # 转 dB 并裁剪
         sinr_eff_db = 10.0 * np.log10(max(sinr_eff_linear, 1e-30))
-        return float(np.clip(sinr_eff_db, sinr_min_db, sinr_max_db))
+        if sinr_eff_db < sinr_min_db:
+            return sinr_min_db
+        if sinr_eff_db > sinr_max_db:
+            return sinr_max_db
+        return float(sinr_eff_db)

@@ -141,7 +141,7 @@ class MUMIMOPFScheduler(SchedulerBase):
             ue_num_prbs=ue_num_prbs,
             ue_tbs_bits=ue_tbs,
             ue_num_re=ue_num_re,
-            mu_groups=mu_groups,  # 关键：传出配对组信息
+            mu_groups=mu_mimo_groups,  # 关键：传出配对组信息
         )
 
     def _mu_mimo_schedule(self, pf_metric, has_data, h_est,

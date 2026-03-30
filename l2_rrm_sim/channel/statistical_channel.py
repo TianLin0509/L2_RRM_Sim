@@ -99,34 +99,33 @@ class StatisticalChannel(ChannelModelBase):
         if hasattr(ue_states[0], 'num_rx_ant'):
             num_rx_ant = ue_states[0].num_rx_ant
 
-        # 生成复高斯信道矩阵 H ~ CN(0, 1)
-        # shape: (num_ue, num_rx_ant, num_tx_ant, num_prb)
-        h_real = self._rng.normal(0, 1/np.sqrt(2), (num_ue, num_rx_ant, num_tx_ant, num_prb))
-        h_imag = self._rng.normal(0, 1/np.sqrt(2), (num_ue, num_rx_ant, num_tx_ant, num_prb))
+        # 生成复高斯信道矩阵 H ~ CN(0, 1) - batch RNG
+        shape = (num_ue, num_rx_ant, num_tx_ant, num_prb)
+        total_elements = num_ue * num_rx_ant * num_tx_ant * num_prb
+        _buf = self._rng.normal(0, 1/np.sqrt(2), 2 * total_elements)
+        h_real = _buf[:total_elements].reshape(shape)
+        h_imag = _buf[total_elements:].reshape(shape)
         h_matrix = h_real + 1j * h_imag
 
-        # SINR 计算
+        # Vectorized SINR computation
         sinr_per_prb = np.zeros((num_ue, max_layers, num_prb))
         wideband_sinr_db = np.zeros(num_ue)
-        actual_channel_matrix = np.zeros_like(h_matrix, dtype=complex)
 
-        for ue in range(num_ue):
-            total_loss_db = self._pathloss_db[ue] + self._shadow_fading_db[ue]
-            total_loss_linear = db_to_linear(total_loss_db)
-            
-            # 将路径损耗应用到信道矩阵
-            # H_actual = H_gaussian / sqrt(PL)
-            actual_channel_matrix[ue] = h_matrix[ue] / np.sqrt(total_loss_linear)
+        total_loss_db = self._pathloss_db + self._shadow_fading_db
+        total_loss_linear = db_to_linear(total_loss_db)
+        sqrt_loss = np.sqrt(total_loss_linear)[:, None, None, None]
+        actual_channel_matrix = h_matrix / sqrt_loss
 
-            # 计算 SU-MIMO SINR (作为参考值)
-            # 简化: SINR = P_tx_per_prb * |h|^2 / (PL * N0)
-            fading_gain = np.abs(h_matrix[ue, 0, 0, :])**2 # 取第一对天线作为参考
-            sinr_per_prb[ue, 0, :] = (
-                self._tx_power_per_prb * fading_gain
-                / (total_loss_linear * self._noise_power_per_prb)
-            )
+        # Vectorized fading gain and SINR
+        fading_gain = np.abs(h_matrix[:, 0, 0, :]) ** 2
+        sinr_per_prb[:, 0, :] = (
+            self._tx_power_per_prb * fading_gain
+            / (total_loss_linear[:, None] * self._noise_power_per_prb)
+        )
 
-            wideband_sinr_db[ue] = linear_to_db(np.mean(sinr_per_prb[ue, 0, :]))
+        # Vectorized wideband SINR
+        mean_sinr = np.mean(sinr_per_prb[:, 0, :], axis=1)
+        wideband_sinr_db = linear_to_db(mean_sinr)
 
         return ChannelState(
             pathloss_db=self._pathloss_db.copy(),

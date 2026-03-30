@@ -50,6 +50,14 @@ class PFSchedulerSUMIMO(SchedulerBase):
     def throughput_avg(self) -> np.ndarray:
         return self._t_avg.copy()
 
+    _LARGE_BUFFER_THRESHOLD = 10**7 * 8  # bits, fast path if all UEs above this
+
+    def _rbg_prb_count(self, rbg: int) -> int:
+        """Return number of PRBs in a given RBG."""
+        s = rbg * self.rbg_size
+        e = min(s + self.rbg_size, self.num_prb)
+        return e - s
+
     def schedule(self, slot_ctx: SlotContext,
                  ue_states: list,
                  channel_state: ChannelState,
@@ -57,11 +65,12 @@ class PFSchedulerSUMIMO(SchedulerBase):
                  ue_buffer_bytes: np.ndarray,
                  ue_mcs: np.ndarray,
                  ue_rank: np.ndarray) -> SchedulingDecision:
-        """PF 调度 (RBG 粒度)"""
+        """PF 调度 (RBG 粒度), buffer-aware"""
         num_ue = self.num_ue
         num_prb = self.num_prb
 
         has_data = ue_buffer_bytes > 0
+        ue_buffer_bits = ue_buffer_bytes.astype(np.int64) * 8
 
         # 将 per-PRB achievable rate 聚合到 per-RBG
         if self._resource_grid is not None:
@@ -75,11 +84,37 @@ class PFSchedulerSUMIMO(SchedulerBase):
             if has_data[ue]:
                 pf_metric[ue, :] = rate_per_rbg[ue, :] / max(self._t_avg[ue], 1e-10)
 
-        # 每 RBG 分配给 metric 最大的 UE
-        rbg_assignment = np.argmax(pf_metric, axis=0)  # (num_rbg,)
-        max_metric = np.max(pf_metric, axis=0)
-        rbg_assignment = rbg_assignment.astype(np.int32)
-        rbg_assignment[max_metric <= 0] = -1
+        # Fast path: if all active UEs have large buffers, simple argmax
+        active_mask = has_data
+        all_large = np.all(ue_buffer_bits[active_mask] >= self._LARGE_BUFFER_THRESHOLD) if np.any(active_mask) else True
+
+        if all_large:
+            # 每 RBG 分配给 metric 最���的 UE
+            rbg_assignment = np.argmax(pf_metric, axis=0)  # (num_rbg,)
+            max_metric = np.max(pf_metric, axis=0)
+            rbg_assignment = rbg_assignment.astype(np.int32)
+            rbg_assignment[max_metric <= 0] = -1
+        else:
+            # Greedy RBG-by-RBG allocation with buffer satisfaction check
+            rbg_assignment = np.full(self.num_rbg, -1, dtype=np.int32)
+            remaining_bits = ue_buffer_bits.copy()
+            # Sort RBGs by max metric descending for better allocation
+            rbg_order = np.argsort(-np.max(pf_metric, axis=0))
+            for rbg in rbg_order:
+                best_ue = -1
+                best_val = 0.0
+                for ue in range(num_ue):
+                    if remaining_bits[ue] <= 0:
+                        continue
+                    if pf_metric[ue, rbg] > best_val:
+                        best_val = pf_metric[ue, rbg]
+                        best_ue = ue
+                if best_ue >= 0:
+                    rbg_assignment[rbg] = best_ue
+                    # Estimate bits this RBG contributes
+                    prb_cnt = self._rbg_prb_count(rbg)
+                    est_bits = rate_per_rbg[best_ue, rbg] * prb_cnt
+                    remaining_bits[best_ue] -= int(est_bits)
 
         # 展开 RBG → PRB
         if self._resource_grid is not None:
@@ -87,7 +122,7 @@ class PFSchedulerSUMIMO(SchedulerBase):
         else:
             prb_assignment = self._expand_to_prb(rbg_assignment)
 
-        # 统计每 UE 分配的 PRB 数
+        # 统计每 UE 分配的 PRB ���
         ue_num_prbs = np.bincount(
             prb_assignment[prb_assignment >= 0],
             minlength=num_ue
@@ -98,11 +133,12 @@ class PFSchedulerSUMIMO(SchedulerBase):
         ue_num_re = np.zeros(num_ue, dtype=np.int64)
         for ue in range(num_ue):
             if ue_num_prbs[ue] > 0:
-                ue_tbs[ue] = compute_tbs(
+                raw_tbs = compute_tbs(
                     self.num_re_per_prb, int(ue_num_prbs[ue]),
                     int(ue_mcs[ue]), int(ue_rank[ue]),
                     self.mcs_table_index
                 )
+                ue_tbs[ue] = min(raw_tbs, ue_buffer_bits[ue]) if ue_buffer_bits[ue] > 0 else raw_tbs
                 ue_num_re[ue] = self.num_re_per_prb * ue_num_prbs[ue]
 
         return SchedulingDecision(

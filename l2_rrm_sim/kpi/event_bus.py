@@ -91,7 +91,7 @@ class EventBus:
         self._running = False
         if self._async_thread:
             self._async_queue.put(None)  # 唤醒线程
-            self._async_thread.join(timeout=5)
+            self._async_thread.join(timeout=0.5)
             self._async_thread = None
 
     def _async_worker(self):

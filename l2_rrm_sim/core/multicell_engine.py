@@ -256,21 +256,47 @@ class MultiCellSimulationEngine:
         noise_power = (1.380649e-23 * 290 * bw_prb_hz
                        * db_to_linear(self.cell_config.noise_figure_db))
 
+        num_tx_ant = self.cell_config.num_tx_ant
+        num_rx_ant = getattr(self.cell_config, 'num_rx_ant', 4)
+        max_layers = self.cell_config.max_layers
+
+        # 生成复高斯信道矩阵 H ~ CN(0,1): (num_ue, num_rx, num_tx, num_prb)
+        total_elem = num_ue * num_rx_ant * num_tx_ant * num_prb
+        _buf = self.rng.channel.normal(0, 1/np.sqrt(2), 2 * total_elem)
+        h_matrix = (_buf[:total_elem] + 1j * _buf[total_elem:]).reshape(
+            num_ue, num_rx_ant, num_tx_ant, num_prb
+        )
+
+        # 路径损耗 + 阴影衰落
+        pl_linear_arr = np.zeros(num_ue)
         for ue_idx, ue in enumerate(ue_states):
             d_2d = self.topology.compute_distance_2d(ue.position, cell_idx)
             d_2d = max(d_2d, 10.0)
             is_los = d_2d < 100.0
             pl_db = pl_func(d_2d, self.cell_config.height_m,
                             ue.position[2], self.carrier_config.carrier_freq_ghz, is_los)
-            pl_linear = db_to_linear(pl_db)
-            fading = self.rng.channel.exponential(1.0, (self.cell_config.max_layers, num_prb))
-            # 动态干扰: 基于上一 slot 各邻小区的 PRB 调度负载
+            pl_linear_arr[ue_idx] = db_to_linear(pl_db)
+
+        # 应用路径损耗到信道矩阵
+        sqrt_loss = np.sqrt(pl_linear_arr)[:, None, None, None]
+        actual_channel = h_matrix / sqrt_loss  # (num_ue, num_rx, num_tx, num_prb)
+
+        # 批量 SVD 计算每层 SINR
+        H_batch = actual_channel.transpose(0, 3, 1, 2).reshape(-1, num_rx_ant, num_tx_ant)
+        _, S_batch, _ = np.linalg.svd(H_batch, full_matrices=False)
+        num_sv = S_batch.shape[1]
+        S_all = S_batch.reshape(num_ue, num_prb, num_sv).transpose(0, 2, 1)
+        n_layers = min(max_layers, num_sv)
+
+        for ue_idx in range(num_ue):
             ue_key = (cell_idx, ue_idx)
             intf_per_prb = self.ici.compute_dynamic_interference(
                 ue_key, cell_idx, self._cell_prb_loads
             )
-            sinr_per_prb[ue_idx] = (
-                tx_power_per_prb * fading / (pl_linear * (noise_power + intf_per_prb[np.newaxis, :]))
+            denom = noise_power + intf_per_prb  # (num_prb,)
+            sinr_per_prb[ue_idx, :n_layers, :] = (
+                tx_power_per_prb * S_all[ue_idx, :n_layers, :] ** 2
+                / (n_layers * denom[np.newaxis, :])
             )
 
         ue_rank = np.ones(num_ue, dtype=np.int32)

@@ -29,7 +29,8 @@ class PHYAbstraction:
     def evaluate(self, sinr_per_prb: np.ndarray,
                  mcs_index: int, num_prbs: int,
                  num_layers: int,
-                 re_per_prb: int = None) -> dict:
+                 re_per_prb: int = None,
+                 sinr_eff_override_linear: float = None) -> dict:
         """评估单个 UE 的 PHY 传输结果
 
         Args:
@@ -52,9 +53,12 @@ class PHYAbstraction:
         actual_re = re_per_prb if re_per_prb is not None else self.num_re_per_prb
 
         # 1. 计算有效 SINR
-        sinr_eff_db = self.eesm.compute(
+        sinr_eff_db_raw = self.eesm.compute(
             sinr_per_prb, mcs_index, self.mcs_table_index
         )
+        sinr_eff_db = sinr_eff_db_raw
+        if sinr_eff_override_linear is not None and sinr_eff_override_linear > 0:
+            sinr_eff_db = 10.0 * np.log10(sinr_eff_override_linear)
 
         # 2. 计算 TBS
         tbs = compute_tbs(
@@ -63,7 +67,9 @@ class PHYAbstraction:
         )
         if tbs <= 0:
             return {
-                'sinr_eff_db': sinr_eff_db, 'tbs': 0, 'bler': 1.0,
+                'sinr_eff_db': sinr_eff_db,
+                'sinr_eff_db_raw': sinr_eff_db_raw,
+                'tbs': 0, 'bler': 1.0,
                 'tbler': 1.0, 'is_success': False, 'decoded_bits': 0
             }
 
@@ -90,6 +96,7 @@ class PHYAbstraction:
 
         return {
             'sinr_eff_db': sinr_eff_db,
+            'sinr_eff_db_raw': sinr_eff_db_raw,
             'tbs': tbs,
             'bler': bler,
             'tbler': tbler,
@@ -102,7 +109,8 @@ class PHYAbstraction:
                        num_prbs_all: np.ndarray,
                        num_layers_all: np.ndarray,
                        prb_assignment: np.ndarray,
-                       re_per_prb: int = None) -> dict:
+                       re_per_prb: int = None,
+                       sinr_eff_override_linear: np.ndarray = None) -> dict:
         """批量评估所有调度 UE
 
         Args:
@@ -119,6 +127,7 @@ class PHYAbstraction:
         num_ue = len(mcs_indices)
         results = {
             'sinr_eff_db': np.full(num_ue, -30.0),
+            'sinr_eff_db_raw': np.full(num_ue, -30.0),
             'tbs': np.zeros(num_ue, dtype=np.int64),
             'bler': np.ones(num_ue),
             'tbler': np.ones(num_ue),
@@ -138,8 +147,17 @@ class PHYAbstraction:
             ue_prb_mask = (prb_assignment == ue)
             sinr_ue = sinr_per_prb_all[ue, :n_layers, :][:, ue_prb_mask]
 
-            result = self.evaluate(sinr_ue, mcs, n_prbs, n_layers,
-                                   re_per_prb=re_per_prb)
+            override = None
+            if sinr_eff_override_linear is not None:
+                override = float(sinr_eff_override_linear[ue])
+            result = self.evaluate(
+                sinr_ue,
+                mcs,
+                n_prbs,
+                n_layers,
+                re_per_prb=re_per_prb,
+                sinr_eff_override_linear=override,
+            )
             for key in results:
                 results[key][ue] = result[key]
 

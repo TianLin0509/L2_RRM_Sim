@@ -340,6 +340,8 @@ class SimulationEngine:
                 ue_rank=np.ones(num_ue, dtype=np.int32),
                 ue_sinr_eff_db=np.full(num_ue, -30.0),
                 ue_throughput_inst=throughput_inst,
+                slot_direction=slot_ctx.slot_direction,
+                num_dl_symbols=slot_ctx.num_dl_symbols,
             )
 
         # 1. 流量生成
@@ -415,6 +417,38 @@ class SimulationEngine:
             return self._run_slot_sionna_phy(slot_ctx, channel_state, ue_rank)
         else:
             return self._run_slot_legacy_phy(slot_ctx, channel_state, ue_rank)
+
+    def _build_harq_combined_sinr(self, raw_sinr_linear: np.ndarray,
+                                  sched, retx_info: dict) -> np.ndarray:
+        """Combine current effective SINR with HARQ history for retransmissions."""
+        combined = raw_sinr_linear.copy()
+        for ue, info in retx_info.items():
+            if sched.ue_num_prbs[ue] <= 0:
+                continue
+            combined[ue] = self.harq_mgr.get_combining_sinr(
+                ue, info['process_id'], float(raw_sinr_linear[ue])
+            )
+        return combined
+
+    def _compute_legacy_raw_sinr_linear(self, channel_state, mcs_indices,
+                                        ue_rank, sched) -> np.ndarray:
+        """Compute current-slot effective SINR before HARQ combining."""
+        from ..utils.math_utils import db_to_linear
+        num_ue = self.num_ue
+        raw_sinr_linear = np.zeros(num_ue, dtype=np.float32)
+        for ue in range(num_ue):
+            if sched.ue_num_prbs[ue] <= 0:
+                continue
+            n_layers = int(ue_rank[ue])
+            ue_prb_mask = (sched.prb_assignment == ue)
+            sinr_ue = channel_state.sinr_per_prb[ue, :n_layers, :][:, ue_prb_mask]
+            sinr_eff_db = self.eesm.compute(
+                sinr_ue,
+                int(mcs_indices[ue]),
+                self.la_config.mcs_table_index,
+            )
+            raw_sinr_linear[ue] = db_to_linear(sinr_eff_db)
+        return raw_sinr_linear
 
     def _run_slot_sionna_phy(self, slot_ctx, channel_state, ue_rank):
         """使用 Sionna PHY 层的 slot 处理 (含 HARQ)"""
@@ -523,11 +557,18 @@ class SimulationEngine:
 
         # --- PHY 评估 ---
         ue_num_re = sched.ue_num_prbs * re_per_prb
+        raw_sinr_eff = self.sionna_phy.compute_sinr_eff(
+            phy_sinr_input, mcs_indices, sched.prb_assignment
+        )
+        combined_sinr_eff = self._build_harq_combined_sinr(
+            raw_sinr_eff, sched, retx_info
+        )
         phy_results = self.sionna_phy.evaluate(
             mcs_indices=mcs_indices,
             sinr_per_re=phy_sinr_input,
             num_allocated_re=ue_num_re.astype(np.int32),
             prb_assignment=sched.prb_assignment,
+            sinr_eff_override=combined_sinr_eff,
         )
 
         # --- HARQ: K1 延迟反馈 ---
@@ -544,7 +585,7 @@ class SimulationEngine:
                 continue
 
             is_success = bool(phy_results['is_success'][ue])
-            sinr_linear = float(phy_results['sinr_eff'][ue])
+            sinr_linear = float(phy_results['sinr_eff_raw'][ue])
             tbs = int(sched.ue_tbs_bits[ue])
 
             # 计算 feedback 到达 slot
@@ -576,7 +617,7 @@ class SimulationEngine:
 
         # --- 更新状态 ---
         self._last_harq = phy_results['harq_feedback'].copy()
-        self._last_sinr_eff = phy_results['sinr_eff'].copy()
+        self._last_sinr_eff = phy_results['sinr_eff_raw'].copy()
         self._last_scheduled_mask = sched.ue_num_prbs > 0
 
         sinr_eff_db = np.where(
@@ -653,10 +694,17 @@ class SimulationEngine:
                 self.harq_mgr.consume_retx(ue)
 
         # PHY 评估
+        raw_sinr_linear = self._compute_legacy_raw_sinr_linear(
+            channel_state, mcs_indices, ue_rank, sched
+        )
+        combined_sinr_linear = self._build_harq_combined_sinr(
+            raw_sinr_linear, sched, retx_info
+        )
         phy_results = self.phy_abs.evaluate_batch(
             channel_state.sinr_per_prb, mcs_indices,
             sched.ue_num_prbs, ue_rank, sched.prb_assignment,
             re_per_prb=re_per_prb,
+            sinr_eff_override_linear=combined_sinr_linear,
         )
 
         # --- HARQ K1 feedback ---
@@ -670,7 +718,7 @@ class SimulationEngine:
                 continue
 
             is_success = bool(phy_results['is_success'][ue])
-            sinr_linear = float(db_to_linear(phy_results['sinr_eff_db'][ue]))
+            sinr_linear = float(raw_sinr_linear[ue])
             tbs = int(sched.ue_tbs_bits[ue])
 
             if self._is_tdd:
@@ -699,9 +747,10 @@ class SimulationEngine:
 
         # 更新状态
         sinr_eff_db = phy_results['sinr_eff_db'].copy()
+        sinr_eff_db_raw = phy_results['sinr_eff_db_raw'].copy()
         self._last_harq_ack = phy_results['is_success'].copy()
         self._last_harq = np.where(phy_results['is_success'], 1, 0).astype(np.int32)
-        self._last_sinr_eff = db_to_linear(sinr_eff_db).astype(np.float32)
+        self._last_sinr_eff = db_to_linear(sinr_eff_db_raw).astype(np.float32)
         self._last_scheduled_mask = sched.ue_num_prbs > 0
 
         return self._finalize_slot(slot_ctx, phy_results, mcs_indices,
@@ -737,6 +786,8 @@ class SimulationEngine:
             ue_rank=ue_rank,
             ue_sinr_eff_db=sinr_eff_db,
             ue_throughput_inst=throughput_inst,
+            slot_direction=slot_ctx.slot_direction,
+            num_dl_symbols=slot_ctx.num_dl_symbols,
             scheduling_decision=sched,
         )
 

@@ -114,9 +114,11 @@ class MultiCellSimulationEngine:
         # PHY 层: Sionna 或 legacy
         try:
             from ..link_adaptation.sionna_phy import SionnaPHY
+            SionnaPHY(num_ue=1)  # 验证能实际初始化
             self._use_sionna_phy = True
-        except ImportError:
+        except (ImportError, RuntimeError, Exception):
             self._use_sionna_phy = False
+            SionnaPHY = None
 
         # 每小区独立的调度器、PHY
         self.cell_schedulers = {}

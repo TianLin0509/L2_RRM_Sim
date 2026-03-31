@@ -35,15 +35,20 @@ class KPIReporter:
         bw_hz = self.carrier_config.bandwidth_mhz * 1e6
 
         # ---- 原始数据 ----
-        ue_bits = c.ue_throughput_bits[s]           # (valid_slots, num_ue)
-        cell_bits = c.cell_throughput_bits[s]        # (valid_slots,)
-        scheduled_mask = c.ue_num_prbs[s] > 0       # (valid_slots, num_ue)
+        ue_bits = c.ue_throughput_bits[s]              # delivered bits
+        ue_sched_bits = c.ue_scheduled_bits[s]         # tx-slot scheduled bits
+        cell_bits = c.cell_throughput_bits[s]          # delivered bits
+        cell_sched_bits = c.cell_scheduled_bits[s]     # tx-slot scheduled bits
+        scheduled_mask = c.ue_num_prbs[s] > 0          # (valid_slots, num_ue)
+        dl_schedulable_mask = np.isin(c.slot_direction[s], ['D', 'S'])
 
         # ============================================================
         # 小区级 KPI
         # ============================================================
         cell_tp_bps = cell_bits / slot_duration_s
         cell_avg_throughput_mbps = float(np.mean(cell_tp_bps) / 1e6)
+        cell_sched_tp_bps = cell_sched_bits / slot_duration_s
+        cell_avg_scheduled_throughput_mbps = float(np.mean(cell_sched_tp_bps) / 1e6)
         spectral_eff = cell_avg_throughput_mbps * 1e6 / bw_hz
 
         # ============================================================
@@ -52,6 +57,8 @@ class KPIReporter:
         # 每 UE 在整个仿真时段的平均吞吐量
         ue_avg_bits_per_slot = np.mean(ue_bits, axis=0)      # (num_ue,)
         ue_avg_tp_mbps = ue_avg_bits_per_slot / slot_duration_s / 1e6
+        ue_avg_sched_bits_per_slot = np.mean(ue_sched_bits, axis=0)
+        ue_avg_scheduled_tp_mbps = ue_avg_sched_bits_per_slot / slot_duration_s / 1e6
 
         # ============================================================
         # 掐头去尾体验速率 (Session-based Experienced Rate)
@@ -121,6 +128,13 @@ class KPIReporter:
         avg_sinr_db = float(np.mean(valid_sinr)) if len(valid_sinr) > 0 else -30.0
 
         # ============================================================
+        # Rank
+        # ============================================================
+        rank_data = c.ue_rank[s].astype(float)
+        scheduled_rank = rank_data[scheduled_mask] if np.any(scheduled_mask) else rank_data
+        avg_rank = float(np.mean(scheduled_rank)) if len(scheduled_rank) > 0 else 1.0
+
+        # ============================================================
         # 公平性
         # ============================================================
         tp_sum = np.sum(ue_avg_tp_mbps)
@@ -137,10 +151,23 @@ class KPIReporter:
         # PRB 利用率
         total_prb_per_slot = np.sum(c.ue_num_prbs[s], axis=1)
         prb_utilization = float(np.mean(total_prb_per_slot) / self.carrier_config.num_prb)
+        if np.any(dl_schedulable_mask):
+            dl_schedulable_prb_utilization = float(
+                np.mean(total_prb_per_slot[dl_schedulable_mask]) / self.carrier_config.num_prb
+            )
+        else:
+            dl_schedulable_prb_utilization = 0.0
+
+        scheduled_bits_total = float(np.sum(cell_sched_bits))
+        delivered_bits_total = float(np.sum(cell_bits))
+        delivery_ratio = (
+            delivered_bits_total / scheduled_bits_total if scheduled_bits_total > 0 else 0.0
+        )
 
         return {
             # 小区级
             'cell_avg_throughput_mbps': cell_avg_throughput_mbps,
+            'cell_avg_scheduled_throughput_mbps': cell_avg_scheduled_throughput_mbps,
             'cell_edge_throughput_mbps': cell_edge_tp_mbps,
             'spectral_efficiency_bps_hz': spectral_eff,
             # 掐头去尾体验速率
@@ -150,6 +177,7 @@ class KPIReporter:
             'experienced_rate_detail': exp_result,
             # 用户级
             'ue_avg_throughput_mbps': ue_avg_tp_mbps,
+            'ue_avg_scheduled_throughput_mbps': ue_avg_scheduled_tp_mbps,
             # BLER
             'avg_bler': avg_bler,
             'bler_per_ue': actual_bler_per_ue,
@@ -158,15 +186,21 @@ class KPIReporter:
             'mcs_distribution': mcs_distribution,
             # SINR
             'avg_sinr_db': avg_sinr_db,
+            # Rank
+            'avg_rank': avg_rank,
+            'ue_rank': rank_data[scheduled_mask] if len(scheduled_mask) > 0 else np.array([1.0]),
             # 公平性
             'jain_fairness': jain_fairness,
             # 调度
             'avg_scheduling_ratio': avg_scheduling_ratio,
             'ue_scheduling_ratio': ue_scheduling_ratio,
             'prb_utilization': prb_utilization,
+            'dl_schedulable_prb_utilization': dl_schedulable_prb_utilization,
+            'delivery_ratio': delivery_ratio,
             # 元数据
             'num_valid_slots': num_valid,
             'num_ue': c.num_ue,
+            'slot_trace': c.build_slot_trace(s),
         }
 
     def _trimmed_mean(self, data: np.ndarray, percent: float) -> float:
@@ -190,15 +224,19 @@ class KPIReporter:
     def _empty_report(self) -> dict:
         return {
             'cell_avg_throughput_mbps': 0, 'cell_edge_throughput_mbps': 0,
+            'cell_avg_scheduled_throughput_mbps': 0,
             'cell_experienced_rate_mbps': 0, 'cell_edge_experienced_rate_mbps': 0,
             'spectral_efficiency_bps_hz': 0,
             'ue_avg_throughput_mbps': np.array([]),
+            'ue_avg_scheduled_throughput_mbps': np.array([]),
             'ue_experienced_rate_mbps': np.array([]),
             'experienced_rate_detail': {},
             'avg_bler': 0, 'bler_per_ue': np.array([]),
             'avg_mcs': 0, 'mcs_distribution': {}, 'avg_sinr_db': 0,
             'jain_fairness': 0, 'avg_scheduling_ratio': 0,
             'ue_scheduling_ratio': np.array([]), 'prb_utilization': 0,
+            'dl_schedulable_prb_utilization': 0, 'delivery_ratio': 0,
+            'slot_trace': {},
             'num_valid_slots': 0, 'num_ue': 0,
         }
 
@@ -211,8 +249,11 @@ class KPIReporter:
         print("-" * 65)
         print("  [小区级]")
         print(f"    平均吞吐量:       {report['cell_avg_throughput_mbps']:.2f} Mbps")
+        print(f"    平均调度吞吐:     {report['cell_avg_scheduled_throughput_mbps']:.2f} Mbps")
+        print(f"    Delivery Ratio:   {report['delivery_ratio']*100:.1f}%")
         print(f"    频谱效率:         {report['spectral_efficiency_bps_hz']:.2f} bps/Hz")
         print(f"    PRB 利用率:       {report['prb_utilization']*100:.1f}%")
+        print(f"    DL-slot PRB 利用: {report['dl_schedulable_prb_utilization']*100:.1f}%")
         print("-" * 65)
         print("  [掐头去尾体验速率]")
         exp_detail = report.get('experienced_rate_detail', {})

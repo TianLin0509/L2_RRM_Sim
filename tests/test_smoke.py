@@ -217,6 +217,33 @@ def test_harq_peek_does_not_consume():
     assert mgr.peek_retx_info(0) is None
 
 
+def test_harq_combining_helper_uses_accumulated_sinr():
+    """单小区主链路应把 HARQ 累积 SINR 合并到重传判决中。"""
+    from types import SimpleNamespace
+    from l2_rrm_sim.core.simulation_engine import SimulationEngine
+    from l2_rrm_sim.harq import HARQManager
+
+    engine = SimulationEngine(_make_config(
+        ue=UEConfig(num_ue=1, num_rx_ant=1, min_distance_m=35.0,
+                    max_distance_m=35.0, speed_kmh=0.0),
+        cell=CellConfig(num_tx_ant=8, num_tx_ports=2, max_layers=1,
+                        cell_radius_m=300, scenario='uma'),
+    ))
+    engine.harq_mgr = HARQManager(num_ue=1, num_processes=4, max_retx=4)
+
+    pid = engine.harq_mgr.start_new_tx(0, mcs=10, num_prbs=10, num_layers=1,
+                                       tbs=2000, slot_idx=0)
+    engine.harq_mgr.process_feedback(0, pid, is_ack=False, sinr_eff_linear=3.0)
+
+    retx_info = {0: {'process_id': pid}}
+    sched = SimpleNamespace(ue_num_prbs=np.array([10], dtype=np.int32))
+    combined = engine._build_harq_combined_sinr(
+        np.array([2.0], dtype=np.float32), sched, retx_info
+    )
+
+    assert np.isclose(combined[0], 5.0)
+
+
 def test_rank_selection_multi_layer():
     """Fix 1 后 statistical channel 应能选出 rank > 1"""
     from l2_rrm_sim.channel.statistical_channel import StatisticalChannel
@@ -372,6 +399,39 @@ def test_tdd_special_slot_uses_fewer_re_and_smaller_tbs():
 
     assert result_d.scheduling_decision.ue_num_re[0] > result_s.scheduling_decision.ue_num_re[0]
     assert result_d.scheduling_decision.ue_tbs_bits[0] > result_s.scheduling_decision.ue_tbs_bits[0]
+
+
+def test_kpi_slot_trace_separates_scheduled_and_delivered_bits():
+    """KPI slot trace 应分离 tx-slot scheduled bits 和 feedback-slot delivered bits。"""
+    from l2_rrm_sim.core.simulation_engine import SimulationEngine
+    from l2_rrm_sim.kpi.kpi_reporter import KPIReporter
+
+    config = _make_config(
+        sim=SimConfig(num_slots=20, random_seed=42, warmup_slots=0),
+        ue=UEConfig(num_ue=1, num_rx_ant=1, min_distance_m=35.0,
+                    max_distance_m=35.0, speed_kmh=0.0),
+        cell=CellConfig(num_tx_ant=8, num_tx_ports=2, max_layers=1,
+                        cell_radius_m=300, scenario='uma'),
+        tdd=TDDConfig(duplex_mode='TDD', pattern='DDDSU',
+                      special_dl_symbols=10, special_gp_symbols=2,
+                      special_ul_symbols=2),
+    )
+    engine = SimulationEngine(config)
+
+    for slot_idx in range(config['sim'].num_slots):
+        result = engine.run_slot(slot_idx)
+        buf_after = np.array([ue.buffer_bytes for ue in engine.ue_states], dtype=np.int64)
+        engine.kpi.collect(slot_idx, result, engine._buf_after_traffic, buf_after)
+
+    report = KPIReporter(engine.kpi, config['carrier']).report()
+    trace = report['slot_trace']
+
+    assert report['cell_avg_scheduled_throughput_mbps'] >= report['cell_avg_throughput_mbps']
+    assert report['dl_schedulable_prb_utilization'] >= report['prb_utilization']
+
+    ul_mask = (trace['slot_direction'] == 'U')
+    assert np.all(trace['cell_scheduled_bits'][ul_mask] == 0)
+    assert np.any(trace['cell_delivered_bits'][ul_mask] > 0)
 
 
 if __name__ == '__main__':

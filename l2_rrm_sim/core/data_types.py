@@ -71,4 +71,6 @@ class SlotResult:
     ue_rank: np.ndarray                # (num_ue,) 使用的 rank
     ue_sinr_eff_db: np.ndarray         # (num_ue,) 有效 SINR [dB]
     ue_throughput_inst: np.ndarray     # (num_ue,) 瞬时吞吐量 [bits/s]
+    slot_direction: str = 'D'
+    num_dl_symbols: int = 14
     scheduling_decision: SchedulingDecision = None

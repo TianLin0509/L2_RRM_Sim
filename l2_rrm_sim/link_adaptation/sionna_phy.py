@@ -140,7 +140,8 @@ class SionnaPHY:
     def evaluate(self, mcs_indices: np.ndarray,
                  sinr_per_re: np.ndarray,
                  num_allocated_re: np.ndarray,
-                 prb_assignment: np.ndarray = None) -> dict:
+                 prb_assignment: np.ndarray = None,
+                 sinr_eff_override: np.ndarray = None) -> dict:
         """评估 PHY 传输结果
 
         使用 sinr_eff 模式调用 PHYAbstraction (先算 EESM, 再查 BLER)。
@@ -148,7 +149,11 @@ class SionnaPHY:
         num_ue = self.num_ue
 
         # 1. 用 Sionna EESM 计算 per-UE sinr_eff
-        sinr_eff = self.compute_sinr_eff(sinr_per_re, mcs_indices, prb_assignment)
+        sinr_eff_raw = self.compute_sinr_eff(sinr_per_re, mcs_indices, prb_assignment)
+        sinr_eff = sinr_eff_raw.copy()
+        if sinr_eff_override is not None:
+            override_mask = np.asarray(sinr_eff_override) > 0
+            sinr_eff[override_mask] = np.asarray(sinr_eff_override)[override_mask]
 
         # 2. 用 sinr_eff 模式调用 PHYAbstraction
         t_mcs = torch.tensor(mcs_indices.reshape(1, -1),
@@ -171,13 +176,14 @@ class SionnaPHY:
             'decoded_bits': decoded_bits[0].cpu().numpy().astype(np.int64),
             'harq_feedback': harq[0].cpu().numpy().astype(np.int32),
             'sinr_eff': se[0].cpu().numpy().astype(np.float32),
+            'sinr_eff_raw': sinr_eff_raw.astype(np.float32),
             'tbler': tbler[0].cpu().numpy().astype(np.float32),
             'bler': bler[0].cpu().numpy().astype(np.float32),
             'is_success': (harq[0].cpu().numpy() == 1),
         }
 
         # 更新缓存
-        self._last_sinr_eff = result['sinr_eff'].copy()
+        self._last_sinr_eff = result['sinr_eff_raw'].copy()
         self._last_harq = result['harq_feedback'].copy()
         self._last_scheduled = (num_allocated_re > 0)
 

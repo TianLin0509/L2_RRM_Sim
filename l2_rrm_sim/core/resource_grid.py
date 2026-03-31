@@ -84,11 +84,27 @@ class ResourceGrid:
     def num_re_per_prb(self) -> int:
         return self._num_re_per_prb
 
+    def compute_re_per_prb(self, num_dl_symbols: int = 14) -> int:
+        """按实际 DL 符号数计算 RE/PRB (TDD Special slot 用)"""
+        if num_dl_symbols <= 0:
+            return 0
+        if num_dl_symbols >= 14:
+            return self._num_re_per_prb
+        return compute_num_re_per_prb(
+            num_pdcch_symbols=self.num_pdcch_symbols,
+            dmrs_type=self.dmrs_type,
+            num_dmrs_cdm_groups=self.dmrs_cdm_groups,
+            num_dmrs_symbols=self.num_dmrs_symbols,
+            num_dl_symbols=num_dl_symbols,
+        )
+
     def get_tbs(self, mcs_index: int, num_prbs: int, num_layers: int,
-                mcs_table_index: int = 1) -> int:
+                mcs_table_index: int = 1,
+                num_dl_symbols: int = 14) -> int:
         """计算 TBS"""
+        re_per_prb = self.compute_re_per_prb(num_dl_symbols)
         return compute_tbs(
-            self._num_re_per_prb, num_prbs,
+            re_per_prb, num_prbs,
             mcs_index, num_layers, mcs_table_index
         )
 

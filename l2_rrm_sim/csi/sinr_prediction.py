@@ -92,6 +92,49 @@ class SINRPredictor:
             'bf_gain_db': float(bf_gain_db),
         }
 
+    def compute_bf_gain_subband(self, H: np.ndarray, pmi_subband: np.ndarray,
+                                num_layers: int = 1,
+                                subband_size_prb: int = 4) -> dict:
+        """基于子带 PMI 计算平均波束增益。"""
+        if H.ndim != 3 or pmi_subband is None or len(pmi_subband) == 0:
+            return self.compute_bf_gain(H, 0, num_layers)
+
+        sb_size = max(int(subband_size_prb), 1)
+        svd_gain_acc = 0.0
+        pmi_gain_acc = 0.0
+        count = 0
+
+        for sb_idx, prb_start in enumerate(range(0, H.shape[2], sb_size)):
+            prb_end = min(prb_start + sb_size, H.shape[2])
+            H_sb = H[:, :, prb_start:prb_end]
+            H_wb = np.mean(H_sb, axis=2)
+
+            U, S, Vh = np.linalg.svd(H_wb, full_matrices=False)
+            W_svd = Vh[:num_layers, :].conj().T
+            H_eff_svd = H_wb @ W_svd
+            svd_gain = np.sum(np.abs(H_eff_svd) ** 2) / num_layers
+
+            pmi = int(pmi_subband[min(sb_idx, len(pmi_subband) - 1)])
+            W_pmi = self.codebook.get_precoding_matrix(pmi, num_layers)
+            H_eff_pmi = H_wb @ W_pmi
+            pmi_gain = np.sum(np.abs(H_eff_pmi) ** 2) / num_layers
+
+            svd_gain_acc += svd_gain
+            pmi_gain_acc += pmi_gain
+            count += 1
+
+        svd_gain_avg = svd_gain_acc / max(count, 1)
+        pmi_gain_avg = pmi_gain_acc / max(count, 1)
+        bf_gain_linear = svd_gain_avg / pmi_gain_avg if pmi_gain_avg > 0 else 1.0
+        bf_gain_db = linear_to_db(bf_gain_linear)
+
+        return {
+            'svd_gain': float(svd_gain_avg),
+            'pmi_gain': float(pmi_gain_avg),
+            'bf_gain_linear': float(bf_gain_linear),
+            'bf_gain_db': float(bf_gain_db),
+        }
+
     def predict_sinr_su(self, cqi: int, bf_gain_db: float) -> float:
         """SU 场景 SINR 预估
 
@@ -171,7 +214,15 @@ class SINRPredictor:
             # 计算 BFGain (如果有当前信道矩阵)
             if channel_matrices is not None:
                 H_ue = channel_matrices[ue]  # (rx_ant, tx_ports, num_prb)
-                bf = self.compute_bf_gain(H_ue, report.pmi, report.ri)
+                if getattr(report, 'pmi_subband', None) is not None:
+                    num_subbands = max(len(report.pmi_subband), 1)
+                    subband_size_prb = int(np.ceil(H_ue.shape[2] / num_subbands))
+                    bf = self.compute_bf_gain_subband(
+                        H_ue, report.pmi_subband, report.ri,
+                        subband_size_prb=subband_size_prb,
+                    )
+                else:
+                    bf = self.compute_bf_gain(H_ue, report.pmi, report.ri)
                 self._bf_gain_db[ue] = bf['bf_gain_db']
                 self._svd_gain[ue] = bf['svd_gain']
                 self._pmi_gain[ue] = bf['pmi_gain']

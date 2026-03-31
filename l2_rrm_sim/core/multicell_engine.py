@@ -294,12 +294,20 @@ class MultiCellSimulationEngine:
                 ue_key, cell_idx, self._cell_prb_loads
             )
             denom = noise_power + intf_per_prb  # (num_prb,)
+            # Rank-independent SINR: P * |s|² / (N0 + I)
             sinr_per_prb[ue_idx, :n_layers, :] = (
                 tx_power_per_prb * S_all[ue_idx, :n_layers, :] ** 2
-                / (n_layers * denom[np.newaxis, :])
+                / denom[np.newaxis, :]
             )
 
         ue_rank = np.ones(num_ue, dtype=np.int32)
+
+        # Apply rank-dependent power scaling: /r for selected rank
+        for ue_idx in range(num_ue):
+            r = int(ue_rank[ue_idx])
+            if r > 0:
+                sinr_per_prb[ue_idx, :r, :] /= r
+                sinr_per_prb[ue_idx, r:, :] = 0.0
 
         # MCS 选择 + PHY 评估
         if self._use_sionna_phy:

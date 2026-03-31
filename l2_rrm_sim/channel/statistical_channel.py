@@ -128,9 +128,11 @@ class StatisticalChannel(ChannelModelBase):
         # S_all: (num_ue, num_sv, num_prb)
 
         n_layers = min(max_layers, num_sv)
+        # Rank-independent SINR: P * |s|² / N0 (不含功率分摊因子 /r)
+        # 下游模块根据实际选定的 rank r 自行除以 r
         sinr_per_prb[:, :n_layers, :] = (
             self._tx_power_per_prb * S_all[:, :n_layers, :] ** 2
-            / (n_layers * self._noise_power_per_prb)
+            / self._noise_power_per_prb
         )
 
         # Wideband SINR based on layer-0 (reference layer)

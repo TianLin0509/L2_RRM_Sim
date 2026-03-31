@@ -93,10 +93,10 @@ class SimulationEngine:
         )
 
         # Rank 自适应
-        use_fixed_rank = (channel_type != 'sionna')
+        # 默认不固定 rank，除非配置中特别指定 (目前从 cell_config.max_layers 决定上限)
         self.rank_adapter = RankAdapter(
             max_rank=self.cell_config.max_layers,
-            fixed_rank=1 if use_fixed_rank else None,
+            fixed_rank=None,  # 允许自适应
         )
 
         # PHY 层 (EESM + OLLA + ILLA + BLER 查表)
@@ -165,6 +165,7 @@ class SimulationEngine:
                 feedback_delay_slots=self.csi_config.feedback_delay_slots,
                 noise_power_per_prb=noise_per_prb,
                 codebook_oversampling=self.csi_config.codebook_oversampling,
+                subband_size_prb=self.csi_config.subband_size_prb,
             )
             self.sinr_predictor = SINRPredictor(
                 num_ue=self.num_ue,
@@ -313,19 +314,32 @@ class SimulationEngine:
         num_ue = self.num_ue
         num_prb = self.carrier_config.num_prb
 
+        # 先交付到期 HARQ 反馈，保证 TDD 下 ACK/NACK 在 UL slot 生效
+        delivered = self.harq_mgr.deliver_feedback(slot_idx)
+        if delivered:
+            for ue_id, fb_result in delivered:
+                if fb_result.get('is_final_ack'):
+                    self._last_harq[ue_id] = 1  # ACK
+                    self._last_harq_ack[ue_id] = True
+                elif fb_result.get('retx_needed'):
+                    self._last_harq[ue_id] = 0  # NACK
+                    self._last_harq_ack[ue_id] = False
+        delivered_bits = self.harq_mgr.get_delivered_decoded_bits()
+
         # TDD: UL slot 跳过 DL 调度 (流量仍生成, UE 仍移动)
         if slot_ctx.slot_direction == 'U':
             self.traffic.generate(slot_ctx, self.ue_states)
             self._buf_after_traffic = np.array(
                 [ue.buffer_bytes for ue in self.ue_states], dtype=np.int64)
+            throughput_inst = delivered_bits.astype(np.float64) / self.carrier_config.slot_duration_s
             return SlotResult(
                 slot_idx=slot_idx,
-                ue_decoded_bits=np.zeros(num_ue, dtype=np.int64),
+                ue_decoded_bits=delivered_bits,
                 ue_bler=np.zeros(num_ue), ue_tb_success=np.zeros(num_ue, dtype=bool),
                 ue_mcs=np.zeros(num_ue, dtype=np.int32),
                 ue_rank=np.ones(num_ue, dtype=np.int32),
                 ue_sinr_eff_db=np.full(num_ue, -30.0),
-                ue_throughput_inst=np.zeros(num_ue),
+                ue_throughput_inst=throughput_inst,
             )
 
         # 1. 流量生成
@@ -348,15 +362,6 @@ class SimulationEngine:
                 and hasattr(self.channel, 'initialize')
                 and self.channel_config.type.lower() == 'sionna'):
             self.channel.initialize(self.cell_config, self.carrier_config, self.ue_states)
-
-        # 2.5 HARQ K1: 交付到期的反馈 (在调度前)
-        delivered = self.harq_mgr.deliver_feedback(slot_idx)
-        if delivered:
-            for ue_id, fb_result in delivered:
-                if fb_result.get('is_final_ack'):
-                    self._last_harq[ue_id] = 1  # ACK
-                elif fb_result.get('retx_needed'):
-                    self._last_harq[ue_id] = 0  # NACK
 
         # 信道更新
         channel_state = self.channel.update(slot_ctx, self.ue_states)
@@ -398,6 +403,14 @@ class SimulationEngine:
         for ue_idx, ue in enumerate(self.ue_states):
             ue.selected_rank = int(ue_rank[ue_idx])
 
+        # Apply rank-dependent power scaling to SINR:
+        # channel stores rank-independent P*|s|²/N0, convert to P*|s|²/(r*N0)
+        for ue_idx in range(num_ue):
+            r = int(ue_rank[ue_idx])
+            if r > 0:
+                channel_state.sinr_per_prb[ue_idx, :r, :] /= r
+                channel_state.sinr_per_prb[ue_idx, r:, :] = 0.0
+
         if self._use_sionna_phy:
             return self._run_slot_sionna_phy(slot_ctx, channel_state, ue_rank)
         else:
@@ -407,7 +420,7 @@ class SimulationEngine:
         """使用 Sionna PHY 层的 slot 处理 (含 HARQ)"""
         num_ue = self.num_ue
         num_prb = self.carrier_config.num_prb
-        re_per_prb = self.resource_grid.num_re_per_prb
+        re_per_prb = self.resource_grid.compute_re_per_prb(slot_ctx.num_dl_symbols)
         slot_idx = slot_ctx.slot_idx
 
         # 初始 MCS (基于宽带 SINR 的保守估计，随后由 OLLA/CQI 细化)
@@ -467,7 +480,8 @@ class SimulationEngine:
         sched = self.scheduler.schedule(
             slot_ctx, self.ue_states, channel_state,
             achievable_rate_per_prb, ue_buffer,
-            mcs_indices, ue_rank
+            mcs_indices, ue_rank,
+            re_per_prb=re_per_prb,
         )
 
         # 调度完成后，消费已被调度的重传进程（未调度的保留在队列中）
@@ -575,11 +589,12 @@ class SimulationEngine:
                                     ue_rank, sinr_eff_db, sched)
 
     def _run_slot_legacy_phy(self, slot_ctx, channel_state, ue_rank):
-        """使用自实现 PHY 层的 slot 处理 (回退模式)"""
+        """使用自实现 PHY 层的 slot 处理 (回退模式, 含 HARQ)"""
         from ..utils.nr_utils import get_spectral_efficiency
         num_ue = self.num_ue
         num_prb = self.carrier_config.num_prb
-        re_per_prb = self.resource_grid.num_re_per_prb
+        re_per_prb = self.resource_grid.compute_re_per_prb(slot_ctx.num_dl_symbols)
+        slot_idx = slot_ctx.slot_idx
 
         # OLLA 更新
         self.olla.update_offsets_batch(
@@ -595,6 +610,9 @@ class SimulationEngine:
                 channel_state.sinr_per_prb[ue, :r, :], mcs_index=0,
                 table_index=self.la_config.mcs_table_index
             )
+        # TDD special slot uses fewer REs, which changes TBS/CBS and therefore
+        # the BLER-constrained MCS selected by ILLA.
+        self.illa.num_re_per_prb = re_per_prb
         mcs_indices = self.olla.select_mcs(sinr_eff_db, est_prbs, ue_rank)
 
         # Achievable rate (rank=1 fast path)
@@ -609,23 +627,80 @@ class SimulationEngine:
                 capacity = np.sum(np.log2(1.0 + np.maximum(sinr_prb, 0)), axis=0)
                 achievable_rate_per_prb[ue, :] = capacity * re_per_prb
 
+        # --- HARQ: peek retx ---
+        has_retx = self.harq_mgr.has_any_retransmission()
+        retx_info = {}
+        for ue in range(num_ue):
+            if has_retx[ue]:
+                info = self.harq_mgr.peek_retx_info(ue)
+                if info is not None:
+                    retx_info[ue] = info
+                    mcs_indices[ue] = info['mcs']
+
         # PF 调度
         ue_buffer = np.array([ue.buffer_bytes for ue in self.ue_states])
+        for ue in retx_info:
+            ue_buffer[ue] = max(ue_buffer[ue], retx_info[ue]['tbs'] // 8)
         sched = self.scheduler.schedule(
             slot_ctx, self.ue_states, channel_state,
-            achievable_rate_per_prb, ue_buffer, mcs_indices, ue_rank
+            achievable_rate_per_prb, ue_buffer, mcs_indices, ue_rank,
+            re_per_prb=re_per_prb,
         )
+
+        # Consume retx for scheduled UEs
+        for ue in retx_info:
+            if sched.ue_num_prbs[ue] > 0:
+                self.harq_mgr.consume_retx(ue)
 
         # PHY 评估
         phy_results = self.phy_abs.evaluate_batch(
             channel_state.sinr_per_prb, mcs_indices,
-            sched.ue_num_prbs, ue_rank, sched.prb_assignment
+            sched.ue_num_prbs, ue_rank, sched.prb_assignment,
+            re_per_prb=re_per_prb,
         )
 
+        # --- HARQ K1 feedback ---
+        final_decoded_bits = np.zeros(num_ue, dtype=np.int64)
+        final_decoded_bits += self.harq_mgr.get_delivered_decoded_bits()
+
+        from ..utils.math_utils import db_to_linear
+        for ue in range(num_ue):
+            is_scheduled = sched.ue_num_prbs[ue] > 0
+            if not is_scheduled:
+                continue
+
+            is_success = bool(phy_results['is_success'][ue])
+            sinr_linear = float(db_to_linear(phy_results['sinr_eff_db'][ue]))
+            tbs = int(sched.ue_tbs_bits[ue])
+
+            if self._is_tdd:
+                fb_slot = self.tdd.get_feedback_slot(slot_idx, self._harq_k1)
+            else:
+                fb_slot = slot_idx + self._harq_k1
+
+            if ue in retx_info:
+                pid = retx_info[ue]['process_id']
+                self.harq_mgr.queue_feedback(
+                    fb_slot, ue, pid, is_success, sinr_linear, tbs
+                )
+            else:
+                if tbs > 0:
+                    pid = self.harq_mgr.start_new_tx(
+                        ue, int(mcs_indices[ue]), int(sched.ue_num_prbs[ue]),
+                        int(ue_rank[ue]), tbs, slot_idx
+                    )
+                    if pid >= 0:
+                        self._active_harq_pid[ue] = pid
+                        self.harq_mgr.queue_feedback(
+                            fb_slot, ue, pid, is_success, sinr_linear, tbs
+                        )
+
+        phy_results['decoded_bits'] = final_decoded_bits
+
         # 更新状态
+        sinr_eff_db = phy_results['sinr_eff_db'].copy()
         self._last_harq_ack = phy_results['is_success'].copy()
         self._last_harq = np.where(phy_results['is_success'], 1, 0).astype(np.int32)
-        from ..utils.math_utils import db_to_linear
         self._last_sinr_eff = db_to_linear(sinr_eff_db).astype(np.float32)
         self._last_scheduled_mask = sched.ue_num_prbs > 0
 

@@ -64,10 +64,16 @@ class PFSchedulerSUMIMO(SchedulerBase):
                  achievable_rate_per_prb: np.ndarray,
                  ue_buffer_bytes: np.ndarray,
                  ue_mcs: np.ndarray,
-                 ue_rank: np.ndarray) -> SchedulingDecision:
-        """PF 调度 (RBG 粒度), buffer-aware"""
+                 ue_rank: np.ndarray,
+                 re_per_prb: int = None) -> SchedulingDecision:
+        """PF 调度 (RBG 粒度), buffer-aware
+
+        Args:
+            re_per_prb: 当前 slot 实际 RE/PRB (TDD special slot 时 < 132)
+        """
         num_ue = self.num_ue
         num_prb = self.num_prb
+        slot_re_per_prb = re_per_prb if re_per_prb is not None else self.num_re_per_prb
 
         has_data = ue_buffer_bytes > 0
         ue_buffer_bits = ue_buffer_bytes.astype(np.int64) * 8
@@ -128,18 +134,18 @@ class PFSchedulerSUMIMO(SchedulerBase):
             minlength=num_ue
         ).astype(np.int32)[:num_ue]
 
-        # 计算 TBS 和 RE 数
+        # 计算 TBS 和 RE 数 (使用当前 slot 实际 RE/PRB)
         ue_tbs = np.zeros(num_ue, dtype=np.int64)
         ue_num_re = np.zeros(num_ue, dtype=np.int64)
         for ue in range(num_ue):
             if ue_num_prbs[ue] > 0:
                 raw_tbs = compute_tbs(
-                    self.num_re_per_prb, int(ue_num_prbs[ue]),
+                    slot_re_per_prb, int(ue_num_prbs[ue]),
                     int(ue_mcs[ue]), int(ue_rank[ue]),
                     self.mcs_table_index
                 )
                 ue_tbs[ue] = min(raw_tbs, ue_buffer_bits[ue]) if ue_buffer_bits[ue] > 0 else raw_tbs
-                ue_num_re[ue] = self.num_re_per_prb * ue_num_prbs[ue]
+                ue_num_re[ue] = slot_re_per_prb * ue_num_prbs[ue]
 
         return SchedulingDecision(
             prb_assignment=prb_assignment,

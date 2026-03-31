@@ -147,3 +147,29 @@ class TypeICodebook:
                 best_W = W.copy()
 
         return best_pmi, best_W, best_avg_gain
+
+    def select_best_pmi_subband(self, H_prb: np.ndarray,
+                                num_layers: int = 1,
+                                subband_size_prb: int = 4) -> tuple:
+        """按子带选择最佳 PMI。"""
+        num_prb = H_prb.shape[2]
+        sb_size = max(int(subband_size_prb), 1)
+        subband_pmi = []
+        subband_w = []
+        subband_gain = []
+
+        for prb_start in range(0, num_prb, sb_size):
+            prb_end = min(prb_start + sb_size, num_prb)
+            H_sb = H_prb[:, :, prb_start:prb_end]
+            best_pmi, best_W, best_avg_gain = self.select_best_pmi_wideband(
+                H_sb, num_layers=num_layers
+            )
+            subband_pmi.append(best_pmi)
+            subband_w.append(best_W)
+            subband_gain.append(best_avg_gain)
+
+        return (
+            np.asarray(subband_pmi, dtype=np.int32),
+            subband_w,
+            np.asarray(subband_gain, dtype=np.float64),
+        )

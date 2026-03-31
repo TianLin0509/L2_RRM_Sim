@@ -112,6 +112,7 @@ class CSIConfig:
     csi_period_slots: int = 10         # CSI-RS 周期 (slots)
     feedback_delay_slots: int = 4      # 反馈延迟 (slots)
     codebook_oversampling: int = 1     # Codebook oversampling factor
+    subband_size_prb: int = 4          # 子带大小 (PRB)
 
 
 @dataclass

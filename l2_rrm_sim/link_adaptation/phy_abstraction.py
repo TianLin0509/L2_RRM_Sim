@@ -28,7 +28,8 @@ class PHYAbstraction:
 
     def evaluate(self, sinr_per_prb: np.ndarray,
                  mcs_index: int, num_prbs: int,
-                 num_layers: int) -> dict:
+                 num_layers: int,
+                 re_per_prb: int = None) -> dict:
         """评估单个 UE 的 PHY 传输结果
 
         Args:
@@ -36,6 +37,7 @@ class PHYAbstraction:
             mcs_index: MCS 索引
             num_prbs: 分配的 PRB 数
             num_layers: 传输层数
+            re_per_prb: 当前 slot RE/PRB (TDD special slot 时 < 132)
 
         Returns:
             dict with keys:
@@ -47,6 +49,8 @@ class PHYAbstraction:
                 'tbler': 1.0, 'is_success': False, 'decoded_bits': 0
             }
 
+        actual_re = re_per_prb if re_per_prb is not None else self.num_re_per_prb
+
         # 1. 计算有效 SINR
         sinr_eff_db = self.eesm.compute(
             sinr_per_prb, mcs_index, self.mcs_table_index
@@ -54,7 +58,7 @@ class PHYAbstraction:
 
         # 2. 计算 TBS
         tbs = compute_tbs(
-            self.num_re_per_prb, num_prbs,
+            actual_re, num_prbs,
             mcs_index, num_layers, self.mcs_table_index
         )
         if tbs <= 0:
@@ -97,7 +101,8 @@ class PHYAbstraction:
                        mcs_indices: np.ndarray,
                        num_prbs_all: np.ndarray,
                        num_layers_all: np.ndarray,
-                       prb_assignment: np.ndarray) -> dict:
+                       prb_assignment: np.ndarray,
+                       re_per_prb: int = None) -> dict:
         """批量评估所有调度 UE
 
         Args:
@@ -106,6 +111,7 @@ class PHYAbstraction:
             num_prbs_all: (num_ue,) 每 UE 分配的 PRB 数
             num_layers_all: (num_ue,) 每 UE 层数
             prb_assignment: (total_num_prb,) PRB 分配
+            re_per_prb: 当前 slot RE/PRB (TDD special slot)
 
         Returns:
             dict with arrays: sinr_eff_db, tbs, bler, tbler, is_success, decoded_bits
@@ -132,7 +138,8 @@ class PHYAbstraction:
             ue_prb_mask = (prb_assignment == ue)
             sinr_ue = sinr_per_prb_all[ue, :n_layers, :][:, ue_prb_mask]
 
-            result = self.evaluate(sinr_ue, mcs, n_prbs, n_layers)
+            result = self.evaluate(sinr_ue, mcs, n_prbs, n_layers,
+                                   re_per_prb=re_per_prb)
             for key in results:
                 results[key][ue] = result[key]
 

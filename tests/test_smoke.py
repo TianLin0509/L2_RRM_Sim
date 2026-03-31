@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from l2_rrm_sim.config.sim_config import (
     SimConfig, CarrierConfig, CellConfig, UEConfig,
     SchedulerConfig, LinkAdaptationConfig, TrafficConfig,
-    ChannelConfig, CSIConfig,
+    ChannelConfig, CSIConfig, TDDConfig,
 )
 
 
@@ -267,6 +267,111 @@ def test_multicell_statistical():
     )
     report = engine.run()
     assert report['avg_cell_throughput_mbps'] >= 0
+
+
+def test_csi_subband_pmi_report():
+    """CSI 反馈应生成子带 PMI/CQI，并保持长度一致。"""
+    from l2_rrm_sim.csi.csi_feedback import CSIFeedbackManager
+
+    num_ue = 2
+    num_rx_ant = 2
+    num_tx_ports = 4
+    num_prb = 9
+    subband_size = 4
+
+    rng = np.random.default_rng(7)
+    H = (rng.normal(size=(num_ue, num_rx_ant, num_tx_ports, num_prb))
+         + 1j * rng.normal(size=(num_ue, num_rx_ant, num_tx_ports, num_prb)))
+
+    mgr = CSIFeedbackManager(
+        num_ue=num_ue,
+        num_tx_ports=num_tx_ports,
+        max_rank=2,
+        csi_period_slots=1,
+        feedback_delay_slots=0,
+        noise_power_per_prb=1e-9,
+        subband_size_prb=subband_size,
+    )
+    reports = mgr.measure_and_report(slot_idx=0, channel_matrices=H, tx_power_per_prb=1.0)
+
+    assert len(reports) == num_ue
+    expected_num_subbands = int(np.ceil(num_prb / subband_size))
+    for report in reports:
+        assert report.pmi_subband is not None
+        assert report.cqi_subband is not None
+        assert len(report.pmi_subband) == expected_num_subbands
+        assert len(report.cqi_subband) == expected_num_subbands
+        assert report.precoding_matrices_subband is not None
+        assert len(report.precoding_matrices_subband) == expected_num_subbands
+
+
+def test_sinr_predictor_uses_subband_pmi():
+    """SINR predictor 应支持使用子带 PMI 计算 BF gain。"""
+    from l2_rrm_sim.csi.csi_feedback import CSIReport
+    from l2_rrm_sim.csi.sinr_prediction import SINRPredictor
+
+    rng = np.random.default_rng(11)
+    H = (rng.normal(size=(1, 2, 4, 8))
+         + 1j * rng.normal(size=(1, 2, 4, 8)))
+
+    predictor = SINRPredictor(num_ue=1, num_tx_ports=4)
+    report = CSIReport(
+        ue_id=0,
+        slot_idx=0,
+        ri=2,
+        pmi=0,
+        pmi_subband=np.array([0, 1], dtype=np.int32),
+        cqi_wideband=10,
+    )
+    sinr = predictor.predict_all_ue([report], H, mode='su')
+
+    assert sinr.shape == (1,)
+    assert np.isfinite(sinr[0])
+    assert predictor.pmi_gain[0] > 0
+
+
+def test_tdd_special_slot_uses_fewer_re_and_smaller_tbs():
+    """TDD special slot 应按实际 DL symbols 缩减 RE/TBS。"""
+    from l2_rrm_sim.core.resource_grid import ResourceGrid
+    from l2_rrm_sim.core.simulation_engine import SimulationEngine
+
+    carrier = CarrierConfig(subcarrier_spacing=30, num_prb=51,
+                            bandwidth_mhz=20, carrier_freq_ghz=3.5)
+    grid = ResourceGrid(carrier)
+
+    full_re = grid.compute_re_per_prb(14)
+    special_re = grid.compute_re_per_prb(10)
+    assert special_re < full_re
+
+    full_tbs = grid.get_tbs(mcs_index=10, num_prbs=carrier.num_prb,
+                            num_layers=1, num_dl_symbols=14)
+    special_tbs = grid.get_tbs(mcs_index=10, num_prbs=carrier.num_prb,
+                               num_layers=1, num_dl_symbols=10)
+    assert special_tbs < full_tbs
+
+    config = _make_config(
+        ue=UEConfig(num_ue=1, num_rx_ant=1, min_distance_m=35.0,
+                    max_distance_m=35.0, speed_kmh=0.0),
+        cell=CellConfig(num_tx_ant=8, num_tx_ports=2, max_layers=1,
+                        cell_radius_m=300, scenario='uma'),
+        tdd=TDDConfig(duplex_mode='TDD', pattern='DDDSU',
+                      special_dl_symbols=10, special_gp_symbols=2,
+                      special_ul_symbols=2),
+    )
+    engine = SimulationEngine(config)
+
+    # Warmup: 让 OLLA MCS 收敛，避免初始 MCS=0 干扰比较
+    for s in range(50):
+        engine.run_slot(s)
+
+    # 比较同一 DDDSU 周期内的 D slot (50) 和 S slot (53)
+    result_d = engine.run_slot(50)  # D slot
+    engine.run_slot(51)  # D
+    engine.run_slot(52)  # D
+    result_s = engine.run_slot(53)  # S slot
+
+    assert result_d.scheduling_decision.ue_num_re[0] > result_s.scheduling_decision.ue_num_re[0]
+    assert result_d.scheduling_decision.ue_tbs_bits[0] > result_s.scheduling_decision.ue_tbs_bits[0]
 
 
 if __name__ == '__main__':

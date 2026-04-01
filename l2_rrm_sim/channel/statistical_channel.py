@@ -13,8 +13,10 @@ from ..core.nr_constants import (
 )
 from ..config.sim_config import CellConfig, CarrierConfig, ChannelConfig
 from ..utils.math_utils import db_to_linear, dbm_to_watt, linear_to_db
+from ..core.registry import register_channel
 
 
+@register_channel("statistical")
 class StatisticalChannel(ChannelModelBase):
     """统计信道模型
 

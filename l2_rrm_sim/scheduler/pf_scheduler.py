@@ -12,8 +12,10 @@ from ..core.data_types import (
     SlotContext, UEState, ChannelState, SchedulingDecision
 )
 from ..utils.nr_utils import compute_tbs
+from ..core.registry import register_scheduler
 
 
+@register_scheduler("pf")
 class PFSchedulerSUMIMO(SchedulerBase):
     """SU-MIMO Proportional Fair 调度器 (RBG 粒度)
 

@@ -13,10 +13,11 @@ from ..config.sim_config import (
 from .data_types import SlotContext, UEState, SlotResult
 from .resource_grid import ResourceGrid
 from .nr_constants import SLOTS_PER_FRAME, SLOTS_PER_SUBFRAME
-from ..channel.statistical_channel import StatisticalChannel
-from ..scheduler.pf_scheduler import PFSchedulerSUMIMO
-from ..scheduler.rank_adaptation import RankAdapter
-from ..traffic.full_buffer import FullBufferTraffic
+from .registry import (
+    get_scheduler_class, get_channel_class,
+    get_channel_estimator_class, get_rank_adapter_class,
+)
+from .builtin_registry import ensure_loaded as _ensure_builtin
 from ..traffic.buffer_manager import BufferManager
 from ..kpi.kpi_collector import KPICollector
 from ..kpi.kpi_reporter import KPIReporter
@@ -38,6 +39,8 @@ class SimulationEngine:
                 sim, carrier, cell, ue, scheduler,
                 link_adaptation, traffic, channel
         """
+        _ensure_builtin()  # 确保内置组件已注册
+
         self.sim_config: SimConfig = config['sim']
         self.carrier_config: CarrierConfig = config['carrier']
         self.cell_config: CellConfig = config['cell']
@@ -75,16 +78,18 @@ class SimulationEngine:
         self.ue_states = self._init_ue_states()
         self.num_ue = len(self.ue_states)
 
-        # 信道 (支持 sionna/statistical 两种模式)
+        # 信道 (通过 registry 查找)
         channel_type = self.channel_config.type.lower()
         if channel_type == 'sionna':
+            # Sionna 信道需要特殊参数，暂保留直接导入
             from ..channel.sionna_channel import SionnaChannel
             self.channel = SionnaChannel(
                 self.cell_config, self.carrier_config, self.channel_config,
                 ue_config=self.ue_config,
             )
         else:
-            self.channel = StatisticalChannel(
+            ChannelClass = get_channel_class(channel_type)
+            self.channel = ChannelClass(
                 self.cell_config, self.carrier_config,
                 self.channel_config, self.rng.channel
             )
@@ -92,11 +97,12 @@ class SimulationEngine:
             self.cell_config, self.carrier_config, self.ue_states
         )
 
-        # Rank 自适应
-        # 默认不固定 rank，除非配置中特别指定 (目前从 cell_config.max_layers 决定上限)
-        self.rank_adapter = RankAdapter(
+        # Rank 自适应 (通过 registry)
+        rank_type = getattr(self.scheduler_config, 'rank_adapter', 'shannon')
+        RankClass = get_rank_adapter_class(rank_type)
+        self.rank_adapter = RankClass(
             max_rank=self.cell_config.max_layers,
-            fixed_rank=None,  # 允许自适应
+            fixed_rank=None,
         )
 
         # PHY 层 (EESM + OLLA + ILLA + BLER 查表)
@@ -134,8 +140,10 @@ class SimulationEngine:
                                           self.rng.phy)
             self._use_sionna_phy = False
 
-        # 调度器 (RBG 粒度)
-        self.scheduler = PFSchedulerSUMIMO(
+        # 调度器 (通过 registry)
+        sched_type = self.scheduler_config.type.lower()
+        SchedulerClass = get_scheduler_class(sched_type)
+        self.scheduler = SchedulerClass(
             num_ue=self.num_ue,
             num_prb=self.carrier_config.num_prb,
             num_re_per_prb=self.resource_grid.num_re_per_prb,
@@ -194,8 +202,10 @@ class SimulationEngine:
         )
 
         # 信道估计器
-        from ..channel.channel_estimator import ChannelEstimator
-        self.channel_estimator = ChannelEstimator(self.rng, estimation_error_std=0.05)
+        # 信道估计器 (通过 registry)
+        est_type = getattr(self.channel_config, 'estimator', 'ls')
+        EstimatorClass = get_channel_estimator_class(est_type)
+        self.channel_estimator = EstimatorClass(self.rng, estimation_error_std=0.05)
 
         # 事件总线 (Observer Pattern)
         from ..kpi.event_bus import EventBus
@@ -823,4 +833,5 @@ class SimulationEngine:
                 rng=self.rng.traffic,
             )
         else:
+            from ..traffic.full_buffer import FullBufferTraffic
             return FullBufferTraffic()

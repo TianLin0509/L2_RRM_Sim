@@ -10,6 +10,7 @@ import numpy as np
 from dataclasses import dataclass, field
 from .traffic_interface import TrafficModelBase
 from ..core.data_types import SlotContext
+from ..core.registry import register_traffic
 
 
 @dataclass
@@ -27,6 +28,7 @@ class FileTransfer:
         return self.remaining_bytes <= 0
 
 
+@register_traffic("ftp_model3")
 class FTPModel3(TrafficModelBase):
     """FTP Model 3 流量模型
 

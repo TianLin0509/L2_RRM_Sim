@@ -1,747 +1,467 @@
-"""Streamlit UI for the L2 RRM single-cell simulator.
+"""L2 RRM 5G NR System-Level Simulator — Streamlit UI
 
-Run with:
-    .venv312/Scripts/streamlit.exe run app.py
+Run:  .venv312/Scripts/streamlit.exe run app.py
 """
-
 from __future__ import annotations
 
-import os
-import sys
-import time
-
-import matplotlib
-import matplotlib.pyplot as plt
+import os, sys, time
 import numpy as np
 import pandas as pd
 import streamlit as st
-
-matplotlib.use("Agg")
+import plotly.express as px
+import plotly.graph_objects as go
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from l2_rrm_sim.config.sim_config import (  # noqa: E402
-    CSIConfig,
-    CarrierConfig,
-    CellConfig,
-    ChannelConfig,
-    LinkAdaptationConfig,
-    SchedulerConfig,
-    SimConfig,
-    TDDConfig,
-    TrafficConfig,
-    UEConfig,
+from l2_rrm_sim.config.sim_config import (
+    CSIConfig, CarrierConfig, CellConfig, ChannelConfig,
+    LinkAdaptationConfig, SchedulerConfig, SimConfig,
+    TDDConfig, TrafficConfig, UEConfig,
 )
 
+# ── Constants ────────────────────────────────────────────────────────
+BW_PRB = {
+    "20 MHz":  {15: 106, 30: 51,  60: 24},
+    "50 MHz":  {15: 270, 30: 133, 60: 65},
+    "100 MHz": {15: 0,   30: 273, 60: 135},
+}
+TDD_PATTERNS = ["DDDSU", "DDSUU", "DDDSUDDSUU", "DDDDDDDSUU"]
+COLORS = dict(teal="#0d9488", orange="#ea580c", slate="#334155",
+              bg="#f8fafc", card="#ffffff", border="#e2e8f0")
 
-BW_PRB_MAP = {
-    "20 MHz": {15: 106, 30: 51, 60: 24},
-    "50 MHz": {15: 270, 30: 133, 60: 65},
-    "100 MHz": {15: 0, 30: 273, 60: 135},
+# ── CSS ──────────────────────────────────────────────────────────────
+def inject_css():
+    st.markdown(f"""<style>
+    .stApp {{ background: {COLORS['bg']}; }}
+    .main .block-container {{ max-width: 1400px; padding-top: 1.5rem; }}
+    [data-testid="stSidebar"] {{
+        background: linear-gradient(180deg, #0f172a 0%, #1e293b 100%);
+    }}
+    [data-testid="stSidebar"] * {{ color: #e2e8f0; }}
+    [data-testid="stSidebar"] .stSelectbox label,
+    [data-testid="stSidebar"] .stSlider label,
+    [data-testid="stSidebar"] .stNumberInput label {{ color: #94a3b8 !important; }}
+    div[data-testid="metric-container"] {{
+        background: {COLORS['card']};
+        border: 1px solid {COLORS['border']};
+        border-radius: 12px;
+        padding: 0.8rem 1rem;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+    }}
+    .kpi-hero {{
+        background: linear-gradient(135deg, #0d9488 0%, #0891b2 100%);
+        color: white; border-radius: 16px; padding: 1.2rem 1.5rem;
+        margin-bottom: 1rem;
+    }}
+    .kpi-hero .title {{ font-size: 1.6rem; font-weight: 700; }}
+    .kpi-hero .subtitle {{ font-size: 0.95rem; opacity: 0.85; margin-top: 0.3rem; }}
+    .kpi-hero .pills {{ display: flex; gap: 0.5rem; flex-wrap: wrap; margin-top: 0.8rem; }}
+    .kpi-hero .pill {{
+        background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3);
+        border-radius: 999px; padding: 0.25rem 0.7rem; font-size: 0.85rem;
+    }}
+    .stTabs [data-baseweb="tab-list"] {{ gap: 0.5rem; }}
+    .stTabs [data-baseweb="tab"] {{
+        border-radius: 8px 8px 0 0; padding: 0.5rem 1.2rem;
+    }}
+    </style>""", unsafe_allow_html=True)
+
+
+# ── State / Presets ──────────────────────────────────────────────────
+def init_state():
+    defaults = dict(
+        preset="TDD Baseline", num_slots=2000, random_seed=42, warmup_slots=200,
+        scs=30, bw="100 MHz", freq=3.5,
+        duplex="TDD", tdd_pat="DDDSU", sp_dl=10, sp_gp=2, sp_ul=2, k1=4,
+        scenario="uma", tx_ant=32, tx_ports=4, max_layers=1,
+        power=46.0, radius=500, bs_h=25.0,
+        n_ue=1, rx_ant=2, speed=3.0, d_min=35.0, d_max=35.0,
+        beta=0.98, bler_t=0.1, olla_d=0.5,
+        traffic="Full Buffer", ch_type="statistical",
+        csi_on=False, csi_period=10, csi_delay=4, sb_prb=4,
+    )
+    for k, v in defaults.items():
+        st.session_state.setdefault(k, v)
+
+PRESETS = {
+    "TDD Baseline": dict(
+        duplex="TDD", tdd_pat="DDDSU", n_ue=1, max_layers=1,
+        traffic="Full Buffer", d_min=35.0, d_max=35.0,
+        num_slots=2000, warmup_slots=200,
+    ),
+    "FDD Rank-1": dict(
+        duplex="FDD", n_ue=1, max_layers=1,
+        traffic="Full Buffer", d_min=35.0, d_max=35.0,
+        num_slots=2000, warmup_slots=200,
+    ),
+    "Multi-UE PF": dict(
+        duplex="TDD", tdd_pat="DDDSU", n_ue=10, max_layers=2,
+        traffic="Full Buffer", d_min=35.0, d_max=500.0,
+        num_slots=3000, warmup_slots=300, csi_on=True,
+    ),
 }
 
-TDD_PATTERNS = ["DDDSU", "DDSUU", "DDDSUDDSUU", "DDDDDDDSUU"]
 
-
-def inject_css() -> None:
-    st.markdown(
-        """
-        <style>
-        :root {
-            --bg: #f4efe5;
-            --panel: rgba(255, 250, 242, 0.9);
-            --panel-strong: rgba(255, 248, 236, 0.98);
-            --ink: #1d2b34;
-            --muted: #5f6f78;
-            --accent: #0f766e;
-            --accent-2: #c2410c;
-            --line: rgba(29, 43, 52, 0.12);
-        }
-        .stApp {
-            background:
-                radial-gradient(circle at top left, rgba(15,118,110,0.14), transparent 32%),
-                radial-gradient(circle at top right, rgba(194,65,12,0.16), transparent 28%),
-                linear-gradient(180deg, #f8f4ec 0%, var(--bg) 100%);
-            color: var(--ink);
-        }
-        .main .block-container {
-            padding-top: 2rem;
-            padding-bottom: 2rem;
-            max-width: 1440px;
-        }
-        h1, h2, h3 {
-            color: var(--ink);
-            letter-spacing: -0.02em;
-        }
-        [data-testid="stSidebar"] {
-            background: linear-gradient(180deg, #183643 0%, #10262f 100%);
-        }
-        [data-testid="stSidebar"] * {
-            color: #eef6f4;
-        }
-        .hero-card, .section-card {
-            background: var(--panel);
-            border: 1px solid var(--line);
-            border-radius: 20px;
-            box-shadow: 0 16px 40px rgba(18, 34, 40, 0.08);
-        }
-        .hero-card {
-            padding: 1.4rem 1.5rem;
-            margin-bottom: 1rem;
-            background:
-                linear-gradient(135deg, rgba(15,118,110,0.12), rgba(255,250,242,0.95)),
-                var(--panel-strong);
-        }
-        .section-card {
-            padding: 1rem 1.1rem;
-            margin-bottom: 0.85rem;
-        }
-        .pill-row {
-            display: flex;
-            gap: 0.55rem;
-            flex-wrap: wrap;
-            margin-top: 0.7rem;
-        }
-        .pill {
-            padding: 0.32rem 0.72rem;
-            border-radius: 999px;
-            background: rgba(15,118,110,0.12);
-            border: 1px solid rgba(15,118,110,0.18);
-            color: var(--ink);
-            font-size: 0.92rem;
-        }
-        .label {
-            color: var(--muted);
-            text-transform: uppercase;
-            letter-spacing: 0.12em;
-            font-size: 0.72rem;
-        }
-        .value {
-            color: var(--ink);
-            font-size: 1.55rem;
-            font-weight: 700;
-            line-height: 1.1;
-        }
-        .small-note {
-            color: var(--muted);
-            font-size: 0.9rem;
-        }
-        div[data-testid="metric-container"] {
-            background: rgba(255, 250, 242, 0.88);
-            border: 1px solid var(--line);
-            border-radius: 18px;
-            padding: 0.85rem 0.95rem;
-            box-shadow: 0 12px 28px rgba(18, 34, 40, 0.06);
-        }
-        div[data-testid="metric-container"] label {
-            color: var(--muted);
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def init_state() -> None:
-    defaults = {
-        "preset_name": "单小区 TDD 基线",
-        "num_slots": 2000,
-        "random_seed": 42,
-        "warmup_slots": 200,
-        "scs": 30,
-        "bw_label": "100 MHz",
-        "carrier_freq": 3.5,
-        "duplex_mode": "TDD",
-        "tdd_pattern": "DDDSU",
-        "special_dl_symbols": 10,
-        "special_gp_symbols": 2,
-        "special_ul_symbols": 2,
-        "harq_k1": 4,
-        "scenario": "uma",
-        "num_tx_ant": 32,
-        "num_tx_ports": 4,
-        "max_layers": 1,
-        "total_power": 46.0,
-        "cell_radius": 500,
-        "bs_height": 25.0,
-        "num_ue": 1,
-        "num_rx_ant": 2,
-        "ue_speed": 3.0,
-        "min_dist": 35.0,
-        "max_dist": 35.0,
-        "sched_type": "PF (Proportional Fair)",
-        "pf_beta": 0.98,
-        "bler_target": 0.1,
-        "olla_delta": 0.5,
-        "traffic_type": "Full Buffer",
-        "ftp_file_size": 512000,
-        "ftp_rate": 2.0,
-        "poisson_pps": 200,
-        "channel_type": "statistical",
-        "csi_enabled": False,
-        "csi_period": 10,
-        "csi_delay": 4,
-        "subband_size_prb": 4,
-        "trace_rows": 40,
-        "trace_focus_ue": 0,
-    }
-    for key, value in defaults.items():
-        st.session_state.setdefault(key, value)
-
-
-def apply_preset(name: str) -> None:
-    presets = {
-        "单小区 TDD 基线": {
-            "preset_name": name,
-            "duplex_mode": "TDD",
-            "tdd_pattern": "DDDSU",
-            "special_dl_symbols": 10,
-            "special_gp_symbols": 2,
-            "special_ul_symbols": 2,
-            "harq_k1": 4,
-            "num_ue": 1,
-            "max_layers": 1,
-            "num_rx_ant": 2,
-            "traffic_type": "Full Buffer",
-            "channel_type": "statistical",
-            "csi_enabled": False,
-            "num_slots": 2000,
-            "warmup_slots": 200,
-            "min_dist": 35.0,
-            "max_dist": 35.0,
-        },
-        "单小区 FDD Rank-1": {
-            "preset_name": name,
-            "duplex_mode": "FDD",
-            "num_ue": 1,
-            "max_layers": 1,
-            "num_rx_ant": 2,
-            "traffic_type": "Full Buffer",
-            "channel_type": "statistical",
-            "csi_enabled": False,
-            "num_slots": 2000,
-            "warmup_slots": 200,
-            "min_dist": 35.0,
-            "max_dist": 35.0,
-        },
-        "多用户 PF 观察": {
-            "preset_name": name,
-            "duplex_mode": "TDD",
-            "tdd_pattern": "DDDSU",
-            "num_ue": 10,
-            "max_layers": 2,
-            "num_rx_ant": 2,
-            "traffic_type": "Full Buffer",
-            "channel_type": "statistical",
-            "csi_enabled": True,
-            "num_slots": 3000,
-            "warmup_slots": 300,
-            "min_dist": 35.0,
-            "max_dist": 500.0,
-        },
-    }
-    for key, value in presets[name].items():
-        st.session_state[key] = value
-
-
-def build_config() -> dict:
-    traffic_type_map = {
-        "Full Buffer": "full_buffer",
-        "FTP Model 3": "ftp_model3",
-        "Poisson": "bursty",
-    }
-    num_prb = BW_PRB_MAP[st.session_state.bw_label].get(st.session_state.scs, 273)
-    if num_prb == 0:
-        num_prb = 273
+# ── Config Builder ───────────────────────────────────────────────────
+def build_config():
+    S = st.session_state
+    traffic_map = {"Full Buffer": "full_buffer", "FTP Model 3": "ftp_model3", "Poisson": "bursty"}
+    num_prb = BW_PRB[S.bw].get(S.scs, 273) or 273
     return {
-        "sim": SimConfig(
-            num_slots=st.session_state.num_slots,
-            random_seed=st.session_state.random_seed,
-            warmup_slots=st.session_state.warmup_slots,
-        ),
-        "carrier": CarrierConfig(
-            subcarrier_spacing=st.session_state.scs,
-            num_prb=num_prb,
-            bandwidth_mhz=float(st.session_state.bw_label.split()[0]),
-            carrier_freq_ghz=st.session_state.carrier_freq,
-        ),
-        "cell": CellConfig(
-            num_tx_ant=st.session_state.num_tx_ant,
-            num_tx_ports=st.session_state.num_tx_ports,
-            max_layers=st.session_state.max_layers,
-            total_power_dbm=st.session_state.total_power,
-            cell_radius_m=float(st.session_state.cell_radius),
-            height_m=st.session_state.bs_height,
-            scenario=st.session_state.scenario,
-        ),
-        "ue": UEConfig(
-            num_ue=st.session_state.num_ue,
-            num_rx_ant=st.session_state.num_rx_ant,
-            speed_kmh=st.session_state.ue_speed,
-            min_distance_m=st.session_state.min_dist,
-            max_distance_m=st.session_state.max_dist,
-        ),
-        "scheduler": SchedulerConfig(type="pf", beta=st.session_state.pf_beta),
-        "link_adaptation": LinkAdaptationConfig(
-            bler_target=st.session_state.bler_target,
-            olla_delta_up=st.session_state.olla_delta,
-        ),
-        "traffic": TrafficConfig(
-            type=traffic_type_map.get(st.session_state.traffic_type, "full_buffer"),
-            ftp_file_size_bytes=int(st.session_state.ftp_file_size),
-            ftp_lambda=st.session_state.ftp_rate,
-        ),
-        "channel": ChannelConfig(
-            type=st.session_state.channel_type,
-            scenario=st.session_state.scenario,
-        ),
-        "csi": CSIConfig(
-            enabled=st.session_state.csi_enabled,
-            csi_period_slots=st.session_state.csi_period,
-            feedback_delay_slots=st.session_state.csi_delay,
-            subband_size_prb=st.session_state.subband_size_prb,
-        ),
-        "tdd": TDDConfig(
-            duplex_mode=st.session_state.duplex_mode,
-            pattern=st.session_state.tdd_pattern,
-            special_dl_symbols=st.session_state.special_dl_symbols,
-            special_gp_symbols=st.session_state.special_gp_symbols,
-            special_ul_symbols=st.session_state.special_ul_symbols,
-            harq_k1=st.session_state.harq_k1,
-        ),
+        "sim": SimConfig(num_slots=S.num_slots, random_seed=S.random_seed, warmup_slots=S.warmup_slots),
+        "carrier": CarrierConfig(subcarrier_spacing=S.scs, num_prb=num_prb,
+                                 bandwidth_mhz=float(S.bw.split()[0]), carrier_freq_ghz=S.freq),
+        "cell": CellConfig(num_tx_ant=S.tx_ant, num_tx_ports=S.tx_ports, max_layers=S.max_layers,
+                           total_power_dbm=S.power, cell_radius_m=float(S.radius),
+                           height_m=S.bs_h, scenario=S.scenario),
+        "ue": UEConfig(num_ue=S.n_ue, num_rx_ant=S.rx_ant, speed_kmh=S.speed,
+                       min_distance_m=S.d_min, max_distance_m=S.d_max),
+        "scheduler": SchedulerConfig(type="pf", beta=S.beta),
+        "link_adaptation": LinkAdaptationConfig(bler_target=S.bler_t, olla_delta_up=S.olla_d),
+        "traffic": TrafficConfig(type=traffic_map.get(S.traffic, "full_buffer")),
+        "channel": ChannelConfig(type=S.ch_type, scenario=S.scenario),
+        "csi": CSIConfig(enabled=S.csi_on, csi_period_slots=S.csi_period,
+                         feedback_delay_slots=S.csi_delay, subband_size_prb=S.sb_prb),
+        "tdd": TDDConfig(duplex_mode=S.duplex, pattern=S.tdd_pat,
+                         special_dl_symbols=S.sp_dl, special_gp_symbols=S.sp_gp,
+                         special_ul_symbols=S.sp_ul, harq_k1=S.k1),
     }
 
 
-def run_simulation(config: dict):
+# ── Simulation Runner ────────────────────────────────────────────────
+def run_simulation(config):
     from l2_rrm_sim.core.simulation_engine import SimulationEngine
     from l2_rrm_sim.kpi.kpi_reporter import KPIReporter
 
     engine = SimulationEngine(config)
-
-    if st.session_state.traffic_type == "FTP Model 3":
-        from l2_rrm_sim.traffic.ftp_model import FTPModel3
-
-        engine.traffic = FTPModel3(
-            file_size_bytes=st.session_state.ftp_file_size,
-            arrival_rate=st.session_state.ftp_rate,
-            slot_duration_s=engine.carrier_config.slot_duration_s,
-            num_ue=engine.num_ue,
-            rng=engine.rng.traffic,
-        )
-    elif st.session_state.traffic_type == "Poisson":
-        from l2_rrm_sim.traffic.bursty_traffic import PoissonTraffic
-
-        engine.traffic = PoissonTraffic(
-            packet_size_bytes=1500,
-            arrival_rate_pps=st.session_state.poisson_pps,
-            slot_duration_s=engine.carrier_config.slot_duration_s,
-            num_ue=engine.num_ue,
-            rng=engine.rng.traffic,
-        )
-
-    ftp_traffic = None
-    if st.session_state.traffic_type == "FTP Model 3" and hasattr(engine.traffic, "dequeue_bytes"):
-        ftp_traffic = engine.traffic
-
     total = config["sim"].num_slots
-    progress_bar = st.progress(0.0, text="Running simulation...")
-    started = time.time()
+    bar = st.progress(0.0, text="Initializing...")
+    t0 = time.time()
 
-    for slot_idx in range(total):
-        slot_result = engine.run_slot(slot_idx)
+    for s in range(total):
+        result = engine.run_slot(s)
         buf_before = engine._buf_after_traffic.copy()
-
-        if ftp_traffic is not None:
-            for ue_idx in range(engine.num_ue):
-                decoded_bytes = int(slot_result.ue_decoded_bits[ue_idx]) // 8
-                if decoded_bytes > 0:
-                    ftp_traffic.dequeue_bytes(ue_idx, decoded_bytes, slot_idx)
-
         buf_after = np.array([ue.buffer_bytes for ue in engine.ue_states], dtype=np.int64)
-        engine.kpi.collect(slot_idx, slot_result, buf_before, buf_after)
+        engine.kpi.collect(s, result, buf_before, buf_after)
+        if (s + 1) % max(total // 50, 1) == 0 or s == total - 1:
+            elapsed = time.time() - t0
+            bar.progress((s + 1) / total,
+                         text=f"Slot {s+1}/{total}  |  {(s+1)/elapsed:.0f} slots/s")
 
-        if (slot_idx + 1) % max(total // 100, 1) == 0 or slot_idx == total - 1:
-            pct = (slot_idx + 1) / total
-            elapsed = time.time() - started
-            speed = (slot_idx + 1) / max(elapsed, 0.01)
-            progress_bar.progress(pct, text=f"Slot {slot_idx + 1}/{total} | {speed:.0f} slots/s")
+    bar.progress(1.0, text=f"Done in {time.time()-t0:.1f}s")
+    report = KPIReporter(engine.kpi, engine.carrier_config).report()
+    harq = engine.harq_mgr.get_all_stats()
 
-    reporter = KPIReporter(engine.kpi, engine.carrier_config)
-    report = reporter.report()
-    harq_stats = engine.harq_mgr.get_all_stats()
-    progress_bar.progress(1.0, text=f"Completed in {time.time() - started:.1f}s")
-    return report, engine.kpi, engine.carrier_config, harq_stats
+    # UE topology data
+    positions = np.array([ue.position[:2] for ue in engine.ue_states])
+    vr = engine.kpi.get_valid_range()
+    avg_sinr = np.mean(engine.kpi.ue_sinr_eff_db[vr], axis=0)
+    avg_tp = np.mean(engine.kpi.ue_throughput_bits[vr], axis=0) / engine.carrier_config.slot_duration_s / 1e6
+
+    topo = pd.DataFrame({
+        "x (m)": positions[:, 0], "y (m)": positions[:, 1],
+        "UE": [f"UE {i}" for i in range(len(positions))],
+        "SINR (dB)": np.round(avg_sinr, 1),
+        "Throughput (Mbps)": np.round(avg_tp, 1),
+        "BLER": np.round(report["bler_per_ue"], 3),
+    })
+
+    return report, engine.kpi, engine.carrier_config, harq, topo
 
 
-def plot_throughput_cdf(kpi, carrier):
-    s = kpi.get_valid_range()
-    ue_avg = np.mean(kpi.ue_throughput_bits[s], axis=0) / carrier.slot_duration_s / 1e6
-    fig, ax = plt.subplots(figsize=(6, 4))
-    sorted_tp = np.sort(ue_avg)
-    cdf = np.arange(1, len(sorted_tp) + 1) / max(len(sorted_tp), 1)
-    ax.plot(sorted_tp, cdf, color="#0f766e", linewidth=2)
-    ax.set_xlabel("UE Avg Throughput (Mbps)")
-    ax.set_ylabel("CDF")
-    ax.set_title("UE Throughput CDF")
-    ax.grid(True, alpha=0.25)
+# ── Topology Plot ────────────────────────────────────────────────────
+def render_topology(topo: pd.DataFrame, cell_radius: float, color_by: str = "SINR (dB)"):
+    fig = px.scatter(
+        topo, x="x (m)", y="y (m)", color=color_by,
+        hover_data=["UE", "SINR (dB)", "Throughput (Mbps)", "BLER"],
+        color_continuous_scale="Viridis", size_max=14,
+    )
+    fig.update_traces(marker=dict(size=12, line=dict(width=1, color="white")))
+
+    # BS marker at origin
+    fig.add_trace(go.Scatter(
+        x=[0], y=[0], mode="markers+text",
+        marker=dict(size=18, color=COLORS["orange"], symbol="star",
+                    line=dict(width=2, color="white")),
+        text=["BS"], textposition="top center",
+        textfont=dict(size=12, color=COLORS["slate"]),
+        showlegend=False, hoverinfo="text", hovertext="Base Station (0, 0)",
+    ))
+
+    # Cell boundary circle
+    theta = np.linspace(0, 2 * np.pi, 100)
+    fig.add_trace(go.Scatter(
+        x=cell_radius * np.cos(theta), y=cell_radius * np.sin(theta),
+        mode="lines", line=dict(color=COLORS["border"], width=1, dash="dot"),
+        showlegend=False, hoverinfo="skip",
+    ))
+
+    fig.update_layout(
+        height=480,
+        xaxis=dict(title="East (m)", scaleanchor="y", range=[-cell_radius*1.15, cell_radius*1.15]),
+        yaxis=dict(title="North (m)", range=[-cell_radius*1.15, cell_radius*1.15]),
+        margin=dict(l=40, r=40, t=30, b=40),
+        plot_bgcolor="white",
+        coloraxis_colorbar=dict(title=color_by, thickness=15),
+    )
     return fig
 
 
-def plot_bler_ts(kpi):
+# ── Chart Helpers ────────────────────────────────────────────────────
+def chart_throughput_cdf(kpi, carrier):
+    s = kpi.get_valid_range()
+    tp = np.sort(np.mean(kpi.ue_throughput_bits[s], axis=0) / carrier.slot_duration_s / 1e6)
+    cdf = np.arange(1, len(tp) + 1) / max(len(tp), 1)
+    fig = px.line(x=tp, y=cdf, labels={"x": "UE Avg Throughput (Mbps)", "y": "CDF"})
+    fig.update_traces(line=dict(color=COLORS["teal"], width=2.5))
+    fig.update_layout(height=350, margin=dict(t=20, b=40))
+    return fig
+
+def chart_bler_trend(kpi):
     s = kpi.get_valid_range()
     success = kpi.ue_tb_success[s].astype(float)
     sched = kpi.ue_num_prbs[s] > 0
-    slot_bler = np.zeros(success.shape[0])
-    for idx in range(success.shape[0]):
-        mask = sched[idx]
-        if np.any(mask):
-            slot_bler[idx] = 1.0 - np.mean(success[idx, mask])
-    fig, ax = plt.subplots(figsize=(6, 4))
-    window = min(200, len(slot_bler))
-    if window > 0:
-        smoothed = np.convolve(slot_bler, np.ones(window) / window, mode="valid")
-        ax.plot(smoothed, color="#c2410c", linewidth=1.7)
-    ax.axhline(y=0.1, color="#1d2b34", linestyle="--", linewidth=1, label="Target 10%")
-    ax.set_xlabel("Slot")
-    ax.set_ylabel("BLER")
-    ax.set_title("BLER Trend")
-    ax.legend()
-    ax.grid(True, alpha=0.25)
+    bler = np.array([1.0 - np.mean(success[i, sched[i]]) if np.any(sched[i]) else 0
+                     for i in range(success.shape[0])])
+    w = min(100, max(len(bler) // 5, 1))
+    smoothed = np.convolve(bler, np.ones(w)/w, mode="valid")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(y=smoothed, mode="lines", name="BLER",
+                             line=dict(color=COLORS["orange"], width=2)))
+    fig.add_hline(y=0.1, line_dash="dash", line_color=COLORS["slate"],
+                  annotation_text="Target 10%", annotation_position="top left")
+    fig.update_layout(height=350, margin=dict(t=20, b=40),
+                      xaxis_title="Slot", yaxis_title="BLER")
     return fig
 
-
-def plot_mcs_dist(kpi):
+def chart_mcs_dist(kpi):
     s = kpi.get_valid_range()
-    sched = kpi.ue_num_prbs[s] > 0
-    mcs = kpi.ue_mcs[s][sched]
-    fig, ax = plt.subplots(figsize=(6, 4))
-    if len(mcs) > 0:
-        ax.hist(mcs, bins=range(30), color="#0f766e", alpha=0.85, edgecolor="#f8f4ec")
-    ax.set_xlabel("MCS Index")
-    ax.set_ylabel("Count")
-    ax.set_title("MCS Distribution")
-    ax.grid(True, alpha=0.25)
+    mcs = kpi.ue_mcs[s][kpi.ue_num_prbs[s] > 0]
+    if len(mcs) == 0:
+        return None
+    counts = np.bincount(mcs, minlength=29)[:29]
+    df = pd.DataFrame({"MCS": range(29), "Count": counts})
+    fig = px.bar(df[df.Count > 0], x="MCS", y="Count", color_discrete_sequence=[COLORS["teal"]])
+    fig.update_layout(height=350, margin=dict(t=20, b=40))
     return fig
 
-
-def plot_sinr_cdf(kpi):
+def chart_sinr_cdf(kpi):
     s = kpi.get_valid_range()
     sinr = kpi.ue_sinr_eff_db[s].ravel()
-    sinr = sinr[sinr > -29]
-    fig, ax = plt.subplots(figsize=(6, 4))
-    if len(sinr) > 0:
-        sorted_s = np.sort(sinr)
-        cdf = np.arange(1, len(sorted_s) + 1) / len(sorted_s)
-        ax.plot(sorted_s, cdf, color="#c2410c", linewidth=1.7)
-    ax.set_xlabel("Effective SINR (dB)")
-    ax.set_ylabel("CDF")
-    ax.set_title("Effective SINR CDF")
-    ax.grid(True, alpha=0.25)
+    sinr = np.sort(sinr[sinr > -29])
+    if len(sinr) == 0:
+        return None
+    cdf = np.arange(1, len(sinr)+1) / len(sinr)
+    fig = px.line(x=sinr, y=cdf, labels={"x": "SINR (dB)", "y": "CDF"})
+    fig.update_traces(line=dict(color=COLORS["orange"], width=2.5))
+    fig.update_layout(height=350, margin=dict(t=20, b=40))
     return fig
 
-
-def plot_cell_tp_ts(kpi, carrier):
+def chart_cell_tp(kpi, carrier):
     s = kpi.get_valid_range()
     delivered = kpi.cell_throughput_bits[s] / carrier.slot_duration_s / 1e6
     scheduled = kpi.cell_scheduled_bits[s] / carrier.slot_duration_s / 1e6
-    
-    # 使用 Pandas 构造数据，方便 Streamlit 原生绘图
-    df_tp = pd.DataFrame({
-        "Scheduled (Mbps)": scheduled,
-        "Delivered (Mbps)": delivered
-    })
-    # 平滑处理
-    window = min(50, len(df_tp))
-    if window > 1:
-        df_tp_smooth = df_tp.rolling(window=window).mean().dropna()
-        return df_tp_smooth
-    return df_tp
+    df = pd.DataFrame({"Scheduled": scheduled, "Delivered": delivered})
+    w = min(50, max(len(df) // 10, 1))
+    df = df.rolling(window=w).mean().dropna()
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(y=df["Scheduled"], mode="lines", name="Scheduled",
+                             line=dict(color=COLORS["slate"], width=1.5, dash="dot")))
+    fig.add_trace(go.Scatter(y=df["Delivered"], mode="lines", name="Delivered",
+                             line=dict(color=COLORS["teal"], width=2.5)))
+    fig.update_layout(height=350, margin=dict(t=20, b=40),
+                      xaxis_title="Slot", yaxis_title="Mbps")
+    return fig
 
 
-def render_summary(config: dict, report: dict, harq: dict) -> None:
-    carrier = config["carrier"]
-    cell = config["cell"]
-    ue = config["ue"]
-    tdd = config["tdd"]
-
-    if tdd.duplex_mode == "FDD":
-        duplex_text = "FDD"
-    else:
-        duplex_text = f"TDD {tdd.pattern} ({tdd.special_dl_symbols}+{tdd.special_gp_symbols}+{tdd.special_ul_symbols})"
-
-    # 计算平均 Rank
-    avg_rank = np.mean(report.get("ue_rank", [1.0]))
-
-    st.markdown(
-        f"""
-        <div class="hero-card">
-            <div class="label">Single-Cell Validation Console</div>
-            <div class="value">L2 RRM Simulator</div>
-            <div class="small-note">
-                围绕单小区场景进行深度协议审计。支持 TDD/FDD 帧结构、HARQ 闭环及 CSI 链路自适应。
-            </div>
-            <div class="pill-row">
-                <div class="pill">{duplex_text}</div>
-                <div class="pill">{ue.num_ue} UE</div>
-                <div class="pill">{carrier.bandwidth_mhz:.0f} MHz @ {carrier.subcarrier_spacing} kHz</div>
-                <div class="pill">Avg Rank: {avg_rank:.2f}</div>
-                <div class="pill">Delivery {report['delivery_ratio']*100:.1f}%</div>
-                <div class="pill">HARQ retx {harq['retx_rate']*100:.1f}%</div>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def slot_trace_frame(report: dict, focus_ue: int, rows: int) -> pd.DataFrame:
-    trace = report["slot_trace"]
-    num_ue = trace["ue_num_prbs"].shape[1] if trace["ue_num_prbs"].ndim == 2 else 0
-    focus_ue = min(max(focus_ue, 0), max(num_ue - 1, 0))
-    frame = pd.DataFrame(
-        {
-            "slot": trace["slot_idx"],
-            "dir": trace["slot_direction"],
-            "dl_symbols": trace["num_dl_symbols"],
-            "cell_sched_bits": trace["cell_scheduled_bits"],
-            "cell_deliv_bits": trace["cell_delivered_bits"],
-            "ue_prbs": trace["ue_num_prbs"][:, focus_ue] if num_ue else [],
-            "ue_re": trace["ue_num_re"][:, focus_ue] if num_ue else [],
-            "ue_sched_bits": trace["ue_scheduled_bits"][:, focus_ue] if num_ue else [],
-            "ue_deliv_bits": trace["ue_delivered_bits"][:, focus_ue] if num_ue else [],
-            "ue_mcs": trace["ue_mcs"][:, focus_ue] if num_ue else [],
-            "ue_rank": trace["ue_rank"][:, focus_ue] if num_ue else [],
-            "ue_sinr_db": np.round(trace["ue_sinr_eff_db"][:, focus_ue], 2) if num_ue else [],
-            "tb_success": trace["ue_tb_success"][:, focus_ue] if num_ue else [],
-        }
-    )
-    return frame.tail(rows).reset_index(drop=True)
-
-
-def render_sidebar() -> None:
+# ── Sidebar ──────────────────────────────────────────────────────────
+def render_sidebar():
+    S = st.session_state
     with st.sidebar:
-        st.markdown("## 场景控制")
-        st.caption("当前网页入口运行的是单小区仿真主引擎。")
+        st.markdown("### Configuration")
 
-        with st.expander("仿真规模", expanded=True):
-            st.number_input("Slots", min_value=100, max_value=50000, step=100, key="num_slots")
-            st.number_input("Random Seed", min_value=0, max_value=99999, key="random_seed")
-            st.number_input("Warmup Slots", min_value=0, max_value=5000, step=50, key="warmup_slots")
+        with st.expander("Simulation", expanded=True):
+            st.number_input("Slots", 100, 50000, step=100, key="num_slots")
+            st.number_input("Seed", 0, 99999, key="random_seed")
+            st.number_input("Warmup", 0, 5000, step=50, key="warmup_slots")
 
-        with st.expander("链路与帧结构", expanded=True):
-            st.selectbox("Duplex", ["TDD", "FDD"], key="duplex_mode")
-            if st.session_state.duplex_mode == "TDD":
-                st.selectbox("TDD Pattern", TDD_PATTERNS, key="tdd_pattern")
-                st.slider("Special DL Symbols", min_value=1, max_value=12, key="special_dl_symbols")
-                st.slider("Special GP Symbols", min_value=0, max_value=6, key="special_gp_symbols")
-                st.slider("Special UL Symbols", min_value=0, max_value=6, key="special_ul_symbols")
-                st.slider("HARQ K1", min_value=1, max_value=10, key="harq_k1")
+        with st.expander("Frame Structure", expanded=True):
+            st.selectbox("Duplex", ["TDD", "FDD"], key="duplex")
+            if S.duplex == "TDD":
+                st.selectbox("Pattern", TDD_PATTERNS, key="tdd_pat")
+                c1, c2, c3 = st.columns(3)
+                c1.number_input("DL", 1, 12, key="sp_dl")
+                c2.number_input("GP", 0, 6, key="sp_gp")
+                c3.number_input("UL", 0, 6, key="sp_ul")
+                st.slider("HARQ K1", 1, 10, key="k1")
             st.selectbox("SCS (kHz)", [15, 30, 60], key="scs")
-            st.selectbox("Bandwidth", ["20 MHz", "50 MHz", "100 MHz"], key="bw_label")
-            st.number_input("Carrier Frequency (GHz)", min_value=0.5, max_value=100.0, step=0.1, key="carrier_freq")
-            num_prb = BW_PRB_MAP[st.session_state.bw_label].get(st.session_state.scs, 273)
-            if num_prb == 0:
-                st.warning(f"{st.session_state.bw_label} @ {st.session_state.scs} kHz is not in the preset map. Use 273 PRB.")
-                num_prb = 273
-            st.info(f"Derived PRB: {num_prb}")
+            st.selectbox("Bandwidth", list(BW_PRB.keys()), key="bw")
 
-        with st.expander("小区与天线", expanded=True):
+        with st.expander("Cell & Antenna", expanded=False):
             st.selectbox("Scenario", ["uma", "umi", "rma"], key="scenario")
-            st.selectbox("BS Tx Antennas", [8, 16, 32, 64], key="num_tx_ant")
-            st.selectbox("CSI-RS Ports", [2, 4, 8], key="num_tx_ports")
+            st.selectbox("TX Antennas", [8, 16, 32, 64], key="tx_ant")
+            st.selectbox("CSI-RS Ports", [2, 4, 8], key="tx_ports")
             st.selectbox("Max Layers", [1, 2, 4], key="max_layers")
-            st.slider("Total Power (dBm)", min_value=30.0, max_value=56.0, step=1.0, key="total_power")
-            st.slider("Cell Radius (m)", min_value=100, max_value=2000, step=50, key="cell_radius")
-            st.number_input("BS Height (m)", min_value=10.0, max_value=50.0, step=1.0, key="bs_height")
+            st.slider("Power (dBm)", 30.0, 56.0, step=1.0, key="power")
+            st.slider("Cell Radius (m)", 100, 2000, step=50, key="radius")
 
-        with st.expander("UE 场景", expanded=True):
-            st.slider("UE Count", min_value=1, max_value=50, key="num_ue")
-            st.selectbox("UE Rx Antennas", [1, 2, 4], key="num_rx_ant")
-            st.slider("UE Speed (km/h)", min_value=0.0, max_value=120.0, step=1.0, key="ue_speed")
-            st.number_input("Min Distance (m)", min_value=10.0, max_value=2000.0, step=5.0, key="min_dist")
-            st.number_input("Max Distance (m)", min_value=10.0, max_value=2000.0, step=5.0, key="max_dist")
+        with st.expander("UE", expanded=False):
+            st.slider("UE Count", 1, 50, key="n_ue")
+            st.selectbox("RX Antennas", [1, 2, 4], key="rx_ant")
+            st.slider("Speed (km/h)", 0.0, 120.0, step=1.0, key="speed")
+            c1, c2 = st.columns(2)
+            c1.number_input("Min Dist", 10.0, 2000.0, step=5.0, key="d_min")
+            c2.number_input("Max Dist", 10.0, 2000.0, step=5.0, key="d_max")
 
-        with st.expander("调度与自适应", expanded=True):
-            st.selectbox("Scheduler", ["PF (Proportional Fair)"], key="sched_type")
-            st.slider("PF Beta", min_value=0.9, max_value=0.999, step=0.001, format="%.3f", key="pf_beta")
-            st.slider("BLER Target", min_value=0.01, max_value=0.30, step=0.01, key="bler_target")
-            st.slider("OLLA Delta Up (dB)", min_value=0.1, max_value=2.0, step=0.1, key="olla_delta")
+        with st.expander("Scheduler & LA", expanded=False):
+            st.slider("PF Beta", 0.9, 0.999, step=0.001, format="%.3f", key="beta")
+            st.slider("BLER Target", 0.01, 0.30, step=0.01, key="bler_t")
 
-        with st.expander("业务与信道", expanded=True):
-            st.selectbox("Traffic", ["Full Buffer", "FTP Model 3", "Poisson"], key="traffic_type")
-            if st.session_state.traffic_type == "FTP Model 3":
-                st.number_input("FTP File Size (bytes)", min_value=10000, max_value=5000000, step=10000, key="ftp_file_size")
-                st.number_input("FTP Arrival Rate (files/s/UE)", min_value=0.1, max_value=50.0, step=0.1, key="ftp_rate")
-            elif st.session_state.traffic_type == "Poisson":
-                st.number_input("Poisson Packets/s/UE", min_value=10, max_value=5000, step=10, key="poisson_pps")
-            st.selectbox("Channel", ["statistical", "sionna"], key="channel_type")
-            st.checkbox("Enable CSI", key="csi_enabled")
-            if st.session_state.csi_enabled:
-                st.number_input("CSI Period (slots)", min_value=5, max_value=100, key="csi_period")
-                st.number_input("Feedback Delay (slots)", min_value=0, max_value=20, key="csi_delay")
-                st.number_input("Subband Size (PRB)", min_value=1, max_value=32, key="subband_size_prb")
-
-        with st.expander("审计视图", expanded=False):
-            st.slider("Slot Trace Rows", min_value=10, max_value=200, step=10, key="trace_rows")
-            st.number_input("Focus UE", min_value=0, max_value=max(st.session_state.num_ue - 1, 0), step=1, key="trace_focus_ue")
+        with st.expander("Traffic & Channel", expanded=False):
+            st.selectbox("Traffic", ["Full Buffer", "FTP Model 3", "Poisson"], key="traffic")
+            st.selectbox("Channel", ["statistical", "sionna"], key="ch_type")
+            st.checkbox("CSI Feedback", key="csi_on")
 
 
-def main() -> None:
-    st.set_page_config(page_title="L2 RRM Simulator", page_icon="📶", layout="wide")
+# ── Main ─────────────────────────────────────────────────────────────
+def main():
+    st.set_page_config(page_title="L2 RRM Simulator", page_icon="📡", layout="wide")
     inject_css()
     init_state()
-
-    st.title("L2 RRM 单小区仿真控制台")
-    st.caption("围绕单小区场景做配置、运行、审计和结果解释。")
-
-    preset_cols = st.columns([1.1, 1.1, 1.1, 2.7])
-    preset_labels = ["单小区 TDD 基线", "单小区 FDD Rank-1", "多用户 PF 观察"]
-    for idx, label in enumerate(preset_labels):
-        if preset_cols[idx].button(label, use_container_width=True):
-            apply_preset(label)
-            st.rerun()
-    preset_cols[3].markdown(
-        f"""
-        <div class="section-card">
-            <div class="label">Active Preset</div>
-            <div class="value" style="font-size:1.2rem;">{st.session_state.preset_name}</div>
-            <div class="small-note">预设会改写当前参数，适合快速切到单小区验证基线。</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
     render_sidebar()
 
-    config = build_config()
-    if st.session_state.min_dist > st.session_state.max_dist:
-        st.error("Min Distance 不能大于 Max Distance。")
-        return
-    if st.session_state.duplex_mode == "TDD":
-        if (
-            st.session_state.special_dl_symbols
-            + st.session_state.special_gp_symbols
-            + st.session_state.special_ul_symbols
-            > 14
-        ):
-            st.error("Special slot 的 DL/GP/UL symbols 之和不能超过 14。")
-            return
+    # ── Header + Presets ──
+    st.markdown("# 📡 L2 RRM Simulator")
+    cols = st.columns(len(PRESETS) + 1)
+    for i, (name, vals) in enumerate(PRESETS.items()):
+        if cols[i].button(name, use_container_width=True):
+            for k, v in vals.items():
+                st.session_state[k] = v
+            st.session_state.preset = name
+            st.rerun()
 
-    summary_cols = st.columns([1.2, 2.6, 1.2])
-    with summary_cols[0]:
-        st.markdown(
-            """
-            <div class="section-card">
-                <div class="label">Scenario Scope</div>
-                <div class="value" style="font-size:1.15rem;">Single-Cell</div>
-                <div class="small-note">当前网页入口走的是 SimulationEngine，不是 multicell engine。</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    with summary_cols[1]:
-        tdd_text = (
-            f"{st.session_state.duplex_mode} · {st.session_state.tdd_pattern}"
-            if st.session_state.duplex_mode == "TDD"
-            else "FDD"
-        )
-        st.markdown(
-            f"""
-            <div class="section-card">
-                <div class="label">Run Summary</div>
-                <div class="value" style="font-size:1.25rem;">{st.session_state.num_ue} UE · {st.session_state.bw_label} @ {st.session_state.scs} kHz</div>
-                <div class="small-note">
-                    {tdd_text} | {st.session_state.channel_type} channel | {st.session_state.traffic_type} traffic | {st.session_state.num_slots} slots
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    with summary_cols[2]:
-        run_btn = st.button("运行仿真", type="primary", use_container_width=True)
+    S = st.session_state
+    duplex_label = f"TDD {S.tdd_pat}" if S.duplex == "TDD" else "FDD"
+    cols[-1].markdown(
+        f"<div style='text-align:center;padding:0.5rem;color:{COLORS['slate']};font-size:0.9rem'>"
+        f"<b>{S.preset}</b><br>{S.n_ue} UE · {S.bw} · {duplex_label}</div>",
+        unsafe_allow_html=True)
 
-    if run_btn:
-        report, kpi_data, carrier_cfg, harq_stats = run_simulation(config)
-        st.session_state["report"] = report
-        st.session_state["kpi"] = kpi_data
-        st.session_state["carrier"] = carrier_cfg
-        st.session_state["harq"] = harq_stats
-        st.session_state["last_config"] = config
+    # ── Validation ──
+    if S.d_min > S.d_max:
+        st.error("Min Distance > Max Distance"); return
+    if S.duplex == "TDD" and S.sp_dl + S.sp_gp + S.sp_ul > 14:
+        st.error("Special slot symbols exceed 14"); return
+
+    # ── Run Button ──
+    if st.button("Run Simulation", type="primary", use_container_width=True):
+        config = build_config()
+        report, kpi, carrier, harq, topo = run_simulation(config)
+        st.session_state.update(dict(
+            report=report, kpi=kpi, carrier=carrier, harq=harq, topo=topo, cfg=config))
 
     if "report" not in st.session_state:
-        st.info("选择预设或调整参数后运行仿真。页面会展示单小区 KPI、HARQ 状态和 slot trace 审计结果。")
+        st.info("Configure parameters in the sidebar and click **Run Simulation**.")
         return
 
-    report = st.session_state["report"]
-    kpi_data = st.session_state["kpi"]
-    carrier_cfg = st.session_state["carrier"]
-    harq = st.session_state["harq"]
-    last_config = st.session_state.get("last_config", config)
+    # ── Unpack results ──
+    report = st.session_state.report
+    kpi = st.session_state.kpi
+    carrier = st.session_state.carrier
+    harq = st.session_state.harq
+    topo = st.session_state.topo
+    cfg = st.session_state.cfg
 
-    render_summary(last_config, report, harq)
+    # ── Hero Card ──
+    avg_rank = report.get("avg_rank", 1.0)
+    st.markdown(f"""<div class="kpi-hero">
+        <div class="title">{report['cell_avg_throughput_mbps']:.1f} Mbps</div>
+        <div class="subtitle">Cell Average Throughput (Delivered)</div>
+        <div class="pills">
+            <span class="pill">BLER {report['avg_bler']:.3f}</span>
+            <span class="pill">MCS {report['avg_mcs']:.1f}</span>
+            <span class="pill">Rank {avg_rank:.2f}</span>
+            <span class="pill">PRB {report['prb_utilization']*100:.0f}%</span>
+            <span class="pill">Delivery {report['delivery_ratio']*100:.1f}%</span>
+            <span class="pill">HARQ retx {harq['retx_rate']*100:.1f}%</span>
+        </div>
+    </div>""", unsafe_allow_html=True)
 
-    st.subheader("核心 KPI")
-    kpi_row_1 = st.columns(5)
-    kpi_row_1[0].metric("Delivered Throughput", f"{report['cell_avg_throughput_mbps']:.2f} Mbps")
-    kpi_row_1[1].metric("Scheduled Throughput", f"{report['cell_avg_scheduled_throughput_mbps']:.2f} Mbps")
-    kpi_row_1[2].metric("Delivery Ratio", f"{report['delivery_ratio']*100:.1f}%")
-    kpi_row_1[3].metric("Avg BLER", f"{report['avg_bler']:.3f}", delta=f"target {st.session_state.bler_target:.2f}")
-    kpi_row_1[4].metric("Avg SINR", f"{report['avg_sinr_db']:.1f} dB")
+    # ── KPI Metrics ──
+    r1 = st.columns(6)
+    r1[0].metric("Delivered TP", f"{report['cell_avg_throughput_mbps']:.1f} Mbps")
+    r1[1].metric("Scheduled TP", f"{report['cell_avg_scheduled_throughput_mbps']:.1f} Mbps")
+    r1[2].metric("Avg BLER", f"{report['avg_bler']:.3f}")
+    r1[3].metric("Avg SINR", f"{report['avg_sinr_db']:.1f} dB")
+    r1[4].metric("Spectral Eff.", f"{report['spectral_efficiency_bps_hz']:.2f} bps/Hz")
+    r1[5].metric("Jain Fairness", f"{report['jain_fairness']:.3f}")
 
-    kpi_row_2 = st.columns(5)
-    kpi_row_2[0].metric("Avg MCS", f"{report['avg_mcs']:.1f}")
-    kpi_row_2[1].metric("PRB Utilization", f"{report['prb_utilization']*100:.1f}%")
-    kpi_row_2[2].metric("DL-slot PRB Util.", f"{report['dl_schedulable_prb_utilization']*100:.1f}%")
-    kpi_row_2[3].metric("Spectral Efficiency", f"{report['spectral_efficiency_bps_hz']:.2f} bps/Hz")
-    kpi_row_2[4].metric("Jain Fairness", f"{report['jain_fairness']:.3f}")
+    # ── Topology + Charts ──
+    tab_topo, tab_charts, tab_ue, tab_trace = st.tabs(
+        ["Cell Topology", "Performance Charts", "UE Details", "Slot Trace"])
 
-    st.subheader("HARQ 与时隙结构")
-    hcols = st.columns(5)
-    hcols[0].metric("Total TX", f"{harq['total_transmissions']}")
-    hcols[1].metric("Total ReTX", f"{harq['total_retransmissions']}")
-    hcols[2].metric("ReTX Rate", f"{harq['retx_rate']*100:.1f}%")
-    hcols[3].metric("Effective BLER", f"{harq['effective_bler']:.4f}")
-    if last_config["tdd"].duplex_mode == "TDD":
-        hcols[4].metric("TDD Pattern", last_config["tdd"].pattern)
-    else:
-        hcols[4].metric("Duplex", "FDD")
+    with tab_topo:
+        col_map, col_ctrl = st.columns([4, 1])
+        with col_ctrl:
+            color_by = st.radio("Color by", ["SINR (dB)", "Throughput (Mbps)", "BLER"],
+                                label_visibility="collapsed")
+        with col_map:
+            fig = render_topology(topo, float(cfg["cell"].cell_radius_m), color_by)
+            st.plotly_chart(fig, use_container_width=True)
 
-    st.subheader("图表")
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(
-        ["吞吐 CDF", "BLER", "MCS 分布", "SINR CDF", "小区吞吐趋势"]
-    )
-    with tab1:
-        st.pyplot(plot_throughput_cdf(kpi_data, carrier_cfg))
-    with tab2:
-        st.pyplot(plot_bler_ts(kpi_data))
-    with tab3:
-        st.pyplot(plot_mcs_dist(kpi_data))
-    with tab4:
-        st.pyplot(plot_sinr_cdf(kpi_data))
-    with tab5:
-        st.line_chart(plot_cell_tp_ts(kpi_data, carrier_cfg))
+        # UE summary table below map
+        st.dataframe(topo.style.format({
+            "x (m)": "{:.0f}", "y (m)": "{:.0f}",
+            "SINR (dB)": "{:.1f}", "Throughput (Mbps)": "{:.1f}", "BLER": "{:.3f}",
+        }), use_container_width=True, hide_index=True)
 
-    st.subheader("UE 视图")
-    ue_df = pd.DataFrame(
-        {
+    with tab_charts:
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Throughput CDF**")
+            st.plotly_chart(chart_throughput_cdf(kpi, carrier), use_container_width=True)
+            st.markdown("**MCS Distribution**")
+            fig = chart_mcs_dist(kpi)
+            if fig: st.plotly_chart(fig, use_container_width=True)
+        with c2:
+            st.markdown("**BLER Trend**")
+            st.plotly_chart(chart_bler_trend(kpi), use_container_width=True)
+            st.markdown("**SINR CDF**")
+            fig = chart_sinr_cdf(kpi)
+            if fig: st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("**Cell Throughput Trend**")
+        st.plotly_chart(chart_cell_tp(kpi, carrier), use_container_width=True)
+
+    with tab_ue:
+        ue_df = pd.DataFrame({
             "UE": range(len(report["ue_avg_throughput_mbps"])),
             "Avg TP (Mbps)": np.round(report["ue_avg_throughput_mbps"], 2),
-            "Scheduled TP (Mbps)": np.round(report["ue_avg_scheduled_throughput_mbps"], 2),
-            "Exp Rate (Mbps)": np.round(report.get("ue_experienced_rate_mbps", np.zeros(0)), 2),
+            "Sched TP (Mbps)": np.round(report["ue_avg_scheduled_throughput_mbps"], 2),
             "BLER": np.round(report["bler_per_ue"], 4),
             "Sched %": np.round(report["ue_scheduling_ratio"] * 100, 1),
-        }
-    )
-    st.dataframe(ue_df, use_container_width=True, hide_index=True)
+        })
+        st.dataframe(ue_df, use_container_width=True, hide_index=True)
 
-    st.subheader("Slot Trace 审计")
-    st.caption("把当前 slot 发包量和到账量拆开看，便于分析 TDD/K1/HARQ 时序。")
-    trace_df = slot_trace_frame(
-        report,
-        focus_ue=st.session_state.trace_focus_ue,
-        rows=st.session_state.trace_rows,
-    )
-    st.dataframe(trace_df, use_container_width=True, hide_index=True)
+    with tab_trace:
+        st.caption("Slot-level audit: scheduled vs delivered bits, per-UE breakdown.")
+        trace = report["slot_trace"]
+        n_ue = trace["ue_num_prbs"].shape[1] if trace["ue_num_prbs"].ndim == 2 else 0
+        focus = st.number_input("Focus UE", 0, max(n_ue - 1, 0), 0)
+        rows = st.slider("Rows", 20, 200, 50)
+        frame = pd.DataFrame({
+            "slot": trace["slot_idx"], "dir": trace["slot_direction"],
+            "dl_sym": trace["num_dl_symbols"],
+            "cell_sched": trace["cell_scheduled_bits"],
+            "cell_deliv": trace["cell_delivered_bits"],
+            "ue_prbs": trace["ue_num_prbs"][:, focus] if n_ue else 0,
+            "ue_mcs": trace["ue_mcs"][:, focus] if n_ue else 0,
+            "ue_rank": trace["ue_rank"][:, focus] if n_ue else 0,
+            "ue_sinr": np.round(trace["ue_sinr_eff_db"][:, focus], 1) if n_ue else 0,
+            "tb_ok": trace["ue_tb_success"][:, focus] if n_ue else False,
+        })
+        st.dataframe(frame.tail(rows).reset_index(drop=True),
+                     use_container_width=True, hide_index=True)
 
 
 if __name__ == "__main__":

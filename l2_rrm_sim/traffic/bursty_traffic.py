@@ -8,8 +8,10 @@
 import numpy as np
 from .traffic_interface import TrafficModelBase
 from ..core.data_types import SlotContext
+from ..core.registry import register_traffic
 
 
+@register_traffic("bursty")
 class PoissonTraffic(TrafficModelBase):
     """Poisson 包到达流量模型
 

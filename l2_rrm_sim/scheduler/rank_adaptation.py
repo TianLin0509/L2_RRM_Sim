@@ -9,9 +9,12 @@ Rank 选择范围: 1 ~ min(num_rx_ant, num_tx_ports, max_layers)
 
 import numpy as np
 from ..utils.nr_utils import compute_tbs, get_spectral_efficiency
+from .rank_interface import RankAdapterBase
+from ..core.registry import register_rank_adapter
 
 
-class RankAdapter:
+@register_rank_adapter("shannon")
+class RankAdapter(RankAdapterBase):
     """秩自适应
 
     评估 rank 1 到 max_rank，选择最大化期望吞吐量的 rank。

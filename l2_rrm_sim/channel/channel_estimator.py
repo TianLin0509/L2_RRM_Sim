@@ -6,9 +6,12 @@
 import numpy as np
 from ..core.data_types import ChannelState
 from ..utils.random_utils import SimRNG
+from .estimator_interface import ChannelEstimatorBase
+from ..core.registry import register_channel_estimator
 
 
-class ChannelEstimator:
+@register_channel_estimator("ls")
+class ChannelEstimator(ChannelEstimatorBase):
     """信道估计器
 
     模拟 LS (Least Squares) 估计，并在信道上添加估计噪声。

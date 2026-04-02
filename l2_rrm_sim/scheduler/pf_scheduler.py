@@ -146,7 +146,7 @@ class PFSchedulerSUMIMO(SchedulerBase):
                     int(ue_mcs[ue]), int(ue_rank[ue]),
                     self.mcs_table_index
                 )
-                ue_tbs[ue] = min(raw_tbs, ue_buffer_bits[ue]) if ue_buffer_bits[ue] > 0 else raw_tbs
+                ue_tbs[ue] = min(raw_tbs, max(ue_buffer_bits[ue], 0))
                 ue_num_re[ue] = slot_re_per_prb * ue_num_prbs[ue]
 
         return SchedulingDecision(

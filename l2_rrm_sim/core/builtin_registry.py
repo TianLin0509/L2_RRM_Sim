@@ -8,6 +8,7 @@ def ensure_loaded():
     """确保所有内置组件已注册到 registry"""
     # 每个模块的 import 会触发 @register_xxx 装饰器执行
     from ..scheduler import pf_scheduler          # noqa: F401 → "pf"
+    from ..scheduler import mu_mimo_scheduler     # noqa: F401 → "mu_mimo"
     from ..scheduler import rank_adaptation       # noqa: F401 → "shannon"
     from ..channel import statistical_channel     # noqa: F401 → "statistical"
     from ..channel import channel_estimator       # noqa: F401 → "ls"

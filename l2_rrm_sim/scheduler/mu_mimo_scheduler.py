@@ -13,8 +13,10 @@ from ..core.data_types import (
     SlotContext, UEState, ChannelState, SchedulingDecision
 )
 from ..utils.nr_utils import compute_tbs
+from ..core.registry import register_scheduler
 
 
+@register_scheduler("mu_mimo")
 class MUMIMOPFScheduler(SchedulerBase):
     """MU-MIMO PF 调度器
 

@@ -778,10 +778,13 @@ class SimulationEngine:
         # 更新缓冲区
         self.buffer_mgr.dequeue(self.ue_states, phy_results['decoded_bits'])
 
-        # 更新调度器吞吐量历史
-        self.scheduler.update_throughput_history(
-            phy_results['decoded_bits'].astype(np.float64)
-        )
+        # 更新调度器吞吐量历史 (用 scheduled TBS 而非 K1-delayed decoded_bits)
+        # PF T_avg 应反映调度决策，不受 HARQ K1 延迟影响
+        scheduled_tp = np.zeros(self.num_ue, dtype=np.float64)
+        if sched is not None:
+            sched_mask = sched.ue_num_prbs > 0
+            scheduled_tp[sched_mask] = sched.ue_tbs_bits[sched_mask].astype(np.float64)
+        self.scheduler.update_throughput_history(scheduled_tp)
 
         # 构造 SlotResult
         slot_duration_s = self.carrier_config.slot_duration_s

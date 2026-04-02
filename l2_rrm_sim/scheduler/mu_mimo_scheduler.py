@@ -30,12 +30,13 @@ class MUMIMOPFScheduler(SchedulerBase):
                  num_re_per_prb: int = 132,
                  mcs_table_index: int = 1,
                  beta: float = 0.98,
-                 orthogonality_threshold: float = 0.3):
+                 orthogonality_threshold: float = 0.5,
+                 resource_grid=None):
         """
         Args:
             max_co_ue: 每 PRB 最多共调度的 UE 数
-            orthogonality_threshold: 信道方向余弦相似度阈值
-                                     小于此值才配对
+            orthogonality_threshold: 信道方向余弦相似度阈值 (< 此值才配对)
+            resource_grid: 资源网格对象 (兼容 PF 调度器接口)
         """
         self.num_ue = num_ue
         self.num_prb = num_prb
@@ -45,6 +46,7 @@ class MUMIMOPFScheduler(SchedulerBase):
         self.mcs_table_index = mcs_table_index
         self.beta = beta
         self.ortho_threshold = orthogonality_threshold
+        self._resource_grid = resource_grid
 
         self._t_avg = np.ones(num_ue, dtype=np.float64)
 
@@ -58,12 +60,15 @@ class MUMIMOPFScheduler(SchedulerBase):
                  achievable_rate_per_prb: np.ndarray,
                  ue_buffer_bytes: np.ndarray,
                  ue_mcs: np.ndarray,
-                 ue_rank: np.ndarray) -> SchedulingDecision:
+                 ue_rank: np.ndarray,
+                 re_per_prb: int = None) -> SchedulingDecision:
         """MU-MIMO PF 调度
 
         使用估计信道 (estimated_channel_matrix) 进行调度决策。
         """
         has_data = ue_buffer_bytes > 0
+        ue_buffer_bits = ue_buffer_bytes.astype(np.int64) * 8
+        slot_re_per_prb = re_per_prb if re_per_prb is not None else self.num_re_per_prb
         num_ue = self.num_ue
         num_prb = self.num_prb
         
@@ -121,17 +126,18 @@ class MUMIMOPFScheduler(SchedulerBase):
             for ue in mu_ue_set:
                 ue_effective_rank[ue] = 1
 
-        # 计算 TBS
+        # 计算 TBS (使用当前 slot 实际 RE/PRB + buffer 限幅)
         ue_tbs = np.zeros(num_ue, dtype=np.int64)
         ue_num_re = np.zeros(num_ue, dtype=np.int64)
         for ue in range(num_ue):
             if ue_num_prbs[ue] > 0:
-                ue_tbs[ue] = compute_tbs(
-                    self.num_re_per_prb, int(ue_num_prbs[ue]),
+                raw_tbs = compute_tbs(
+                    slot_re_per_prb, int(ue_num_prbs[ue]),
                     int(ue_mcs[ue]), int(ue_effective_rank[ue]),
                     self.mcs_table_index
                 )
-                ue_num_re[ue] = self.num_re_per_prb * ue_num_prbs[ue]
+                ue_tbs[ue] = min(raw_tbs, ue_buffer_bits[ue]) if ue_buffer_bits[ue] > 0 else raw_tbs
+                ue_num_re[ue] = slot_re_per_prb * ue_num_prbs[ue]
 
         # 用第一个 UE 的 ID 作为 prb_assignment
         for prb in range(num_prb):

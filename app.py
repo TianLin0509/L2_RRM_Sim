@@ -59,7 +59,7 @@ def init_state():
         scenario="uma", tx_ant=32, tx_ports=4, max_layers=1,
         power=46.0, radius=500, bs_h=25.0,
         n_ue=1, rx_ant=2, speed=3.0, d_min=35.0, d_max=500.0,
-        beta=0.98, bler_t=0.1, olla_d=0.5,
+        sched_type="pf", beta=0.98, bler_t=0.1, olla_d=0.5,
         traffic="Full Buffer", ch_type="statistical",
         csi_on=False, csi_period=10, csi_delay=4, sb_prb=4,
     )
@@ -89,7 +89,7 @@ def build_config():
                            height_m=S.bs_h, scenario=S.scenario),
         "ue": UEConfig(num_ue=S.n_ue, num_rx_ant=S.rx_ant, speed_kmh=S.speed,
                        min_distance_m=S.d_min, max_distance_m=S.d_max),
-        "scheduler": SchedulerConfig(type="pf", beta=S.beta),
+        "scheduler": SchedulerConfig(type=S.sched_type, beta=S.beta),
         "link_adaptation": LinkAdaptationConfig(bler_target=S.bler_t, olla_delta_up=S.olla_d),
         "traffic": TrafficConfig(type=traffic_map.get(S.traffic, "full_buffer")),
         "channel": ChannelConfig(type=S.ch_type, scenario=S.scenario),
@@ -339,6 +339,8 @@ def render_sidebar():
 
         # Advanced
         with st.expander("Advanced", expanded=False):
+            st.selectbox("Scheduler", ["pf", "mu_mimo"], key="sched_type",
+                         format_func=lambda x: {"pf": "PF (SU-MIMO)", "mu_mimo": "PF (MU-MIMO)"}[x])
             st.slider("PF Beta", 0.9, 0.999, step=0.001, format="%.3f", key="beta")
             st.slider("BLER Target", 0.01, 0.30, step=0.01, key="bler_t")
             st.selectbox("Traffic", ["Full Buffer", "FTP Model 3", "Poisson"], key="traffic")

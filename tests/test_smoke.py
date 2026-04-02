@@ -434,6 +434,48 @@ def test_kpi_slot_trace_separates_scheduled_and_delivered_bits():
     assert np.any(trace['cell_delivered_bits'][ul_mask] > 0)
 
 
+def test_mu_mimo_scheduler_runs():
+    """MU-MIMO 调度器应能通过引擎正常运行。"""
+    from l2_rrm_sim.core.simulation_engine import SimulationEngine
+    config = _make_config(
+        ue=UEConfig(num_ue=4, num_rx_ant=2, min_distance_m=50.0,
+                    max_distance_m=300.0, speed_kmh=0.0),
+        cell=CellConfig(num_tx_ant=8, num_tx_ports=4, max_layers=2,
+                        cell_radius_m=300, scenario='uma'),
+        scheduler=SchedulerConfig(type='mu_mimo', beta=0.98),
+    )
+    engine = SimulationEngine(config)
+    # 跑 50 个 slot 不崩溃
+    for s in range(50):
+        result = engine.run_slot(s)
+    assert result.ue_decoded_bits is not None
+    assert len(result.ue_mcs) == 4
+
+
+def test_mu_mimo_tdd_special_slot_tbs():
+    """MU-MIMO TDD special slot 的 TBS 应小于 D slot。"""
+    from l2_rrm_sim.core.simulation_engine import SimulationEngine
+    config = _make_config(
+        ue=UEConfig(num_ue=2, num_rx_ant=2, min_distance_m=50.0,
+                    max_distance_m=50.0, speed_kmh=0.0),
+        cell=CellConfig(num_tx_ant=8, num_tx_ports=4, max_layers=1,
+                        cell_radius_m=300, scenario='uma'),
+        scheduler=SchedulerConfig(type='mu_mimo', beta=0.98),
+        tdd=TDDConfig(duplex_mode='TDD', pattern='DDDSU',
+                      special_dl_symbols=10, special_gp_symbols=2,
+                      special_ul_symbols=2),
+    )
+    engine = SimulationEngine(config)
+    # Warmup
+    for s in range(50):
+        engine.run_slot(s)
+    result_d = engine.run_slot(50)  # D
+    engine.run_slot(51)
+    engine.run_slot(52)
+    result_s = engine.run_slot(53)  # S
+    assert result_d.scheduling_decision.ue_num_re.sum() > result_s.scheduling_decision.ue_num_re.sum()
+
+
 if __name__ == '__main__':
     import pytest
     pytest.main([__file__, '-v'])

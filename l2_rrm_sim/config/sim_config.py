@@ -116,11 +116,31 @@ class CSIConfig:
 
 
 @dataclass
+class HARQConfig:
+    """HARQ 配置"""
+    num_processes: int = 16            # HARQ 进程数
+    max_retx: int = 4                  # 最大重传次数
+    combining_type: str = "ir"         # 'chase' (MRC) 或 'ir' (Incremental Redundancy)
+    # IR 增益因子 (per RV): 不同 RV 传输不同冗余位的编码增益
+    # 可按链路级仿真结果标定，高码率场景增益更大
+    ir_gain_rv0: float = 1.0           # RV0: 系统位 (基准)
+    ir_gain_rv2: float = 1.35          # RV2: 第一组校验位
+    ir_gain_rv3: float = 1.25          # RV3: 第二组校验位
+    ir_gain_rv1: float = 1.15          # RV1: 混合位
+
+
+@dataclass
 class ChannelConfig:
     """信道配置"""
     type: str = "statistical"          # 信道类型 (statistical/sionna)
     scenario: str = "uma"              # 3GPP 场景
     shadow_fading_std_db: float = 4.0  # 阴影衰落标准差 (dB) — LOS UMa
+    # Kronecker 空间相关
+    spatial_correlation: str = "none"  # "none" | "low" | "medium" | "high"
+    # Jake's 时间演进 (Doppler)
+    doppler_enabled: bool = False      # 统计信道 slot 间时间相关
+    # 天线增益
+    antenna_gain_enabled: bool = False # 3GPP element pattern
 
 
 def load_config(yaml_path: str) -> dict:
@@ -140,5 +160,6 @@ def load_config(yaml_path: str) -> dict:
         'channel': ChannelConfig(**raw.get('channel', {})),
         'csi': CSIConfig(**raw.get('csi', {})),
         'tdd': TDDConfig(**raw.get('tdd', {})),
+        'harq': HARQConfig(**raw.get('harq', {})),
     }
     return config

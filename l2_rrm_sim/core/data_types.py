@@ -41,6 +41,8 @@ class ChannelState:
     actual_channel_matrix: np.ndarray = None
     # 估计信道 (含估计误差/反馈延迟), (num_ue, rx_ant, tx_ant, num_prb)
     estimated_channel_matrix: np.ndarray = None
+    # SVD 特征值缓存 (num_ue, max_layers, num_prb), singular values
+    eigenvalues: np.ndarray = None
 
 
 @dataclass

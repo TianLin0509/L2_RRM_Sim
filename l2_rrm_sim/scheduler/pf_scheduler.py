@@ -8,10 +8,12 @@ PF metric: R_achievable[ue, rbg] / T_avg[ue]
 
 import numpy as np
 from .scheduler_interface import SchedulerBase
+from .se_estimator import SEEstimator
 from ..core.data_types import (
     SlotContext, UEState, ChannelState, SchedulingDecision
 )
 from ..utils.nr_utils import compute_tbs
+from ..utils.math_utils import linear_to_db
 from ..core.registry import register_scheduler
 
 
@@ -47,6 +49,9 @@ class PFSchedulerSUMIMO(SchedulerBase):
 
         # 时间平均吞吐量
         self._t_avg = np.ones(num_ue, dtype=np.float64)
+
+        # SE 估算器 (用于 RB 需求预估和边缘用户处理)
+        self._se_estimator = SEEstimator()
 
     @property
     def throughput_avg(self) -> np.ndarray:
@@ -95,6 +100,7 @@ class PFSchedulerSUMIMO(SchedulerBase):
         # Fast path: if all active UEs have large buffers, simple argmax
         active_mask = has_data
         all_large = np.all(ue_buffer_bits[active_mask] >= self._LARGE_BUFFER_THRESHOLD) if np.any(active_mask) else True
+        est_rbg = np.zeros(num_ue, dtype=int)  # 初始化 (slow path 会覆盖)
 
         if all_large:
             # 每 RBG 分配给 metric 最���的 UE
@@ -103,9 +109,24 @@ class PFSchedulerSUMIMO(SchedulerBase):
             rbg_assignment = rbg_assignment.astype(np.int32)
             rbg_assignment[max_metric <= 0] = -1
         else:
-            # Greedy RBG-by-RBG allocation with buffer satisfaction check
+            # Buffer-aware allocation with edge-user handling
+            # (对标 AirView calcSURefreshUESelCutEdge)
             rbg_assignment = np.full(self.num_rbg, -1, dtype=np.int32)
             remaining_bits = ue_buffer_bits.copy()
+
+            # SE-based RB estimation for each active UE
+            est_rbg = np.zeros(num_ue, dtype=int)
+            for ue in range(num_ue):
+                if has_data[ue]:
+                    sinr_wb = channel_state.sinr_per_prb[ue, 0, :]
+                    mean_sinr = np.mean(sinr_wb[sinr_wb > 0]) if np.any(sinr_wb > 0) else 1e-6
+                    sinr_db = linear_to_db(mean_sinr)
+                    est_prb = self._se_estimator.estimate_rb_num(
+                        float(ue_buffer_bits[ue]), sinr_db,
+                        int(ue_rank[ue]), slot_re_per_prb
+                    )
+                    est_rbg[ue] = max(1, (est_prb + self.rbg_size - 1) // self.rbg_size)
+
             # Sort RBGs by max metric descending for better allocation
             rbg_order = np.argsort(-np.max(pf_metric, axis=0))
             for rbg in rbg_order:
@@ -137,6 +158,7 @@ class PFSchedulerSUMIMO(SchedulerBase):
         ).astype(np.int32)[:num_ue]
 
         # 计算 TBS 和 RE 数 (使用当前 slot 实际 RE/PRB)
+        # 边缘用户处理: 如果分配的 RBG 少于估算需求, 按比例折算 TBS
         ue_tbs = np.zeros(num_ue, dtype=np.int64)
         ue_num_re = np.zeros(num_ue, dtype=np.int64)
         for ue in range(num_ue):
@@ -146,7 +168,14 @@ class PFSchedulerSUMIMO(SchedulerBase):
                     int(ue_mcs[ue]), int(ue_rank[ue]),
                     self.mcs_table_index
                 )
-                ue_tbs[ue] = min(raw_tbs, max(ue_buffer_bits[ue], 0))
+                buf_bits = max(ue_buffer_bits[ue], 0)
+                # Edge user: 分配 RBG < 估算 RBG → 折算
+                if not all_large and est_rbg[ue] > 0:
+                    allocated_rbg = (ue_num_prbs[ue] + self.rbg_size - 1) // self.rbg_size
+                    if allocated_rbg < est_rbg[ue]:
+                        edge_ratio = allocated_rbg / est_rbg[ue]
+                        buf_bits = int(buf_bits * edge_ratio)
+                ue_tbs[ue] = min(raw_tbs, buf_bits)
                 ue_num_re[ue] = slot_re_per_prb * ue_num_prbs[ue]
 
         return SchedulingDecision(

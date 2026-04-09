@@ -105,11 +105,11 @@ class SimulationEngine:
             fixed_rank=None,
         )
 
-        # PHY 层 (EESM + OLLA + ILLA + BLER 查表)
-        # 优先使用 Sionna PHY (3GPP 合规); 不可用时回退到自实现
+        # PHY 层 (统一接口: PHYBase)
+        # 优先使用 Sionna PHY (3GPP 合规); 不可用时回退到 Legacy 适配器
         try:
             from ..link_adaptation.sionna_phy import SionnaPHY
-            self.sionna_phy = SionnaPHY(
+            self.phy = SionnaPHY(
                 num_ue=self.num_ue,
                 bler_target=self.la_config.bler_target,
                 delta_up=self.la_config.olla_delta_up,
@@ -119,26 +119,20 @@ class SimulationEngine:
             )
             self._use_sionna_phy = True
         except (ImportError, RuntimeError):
-            # 回退到自实现
-            from ..link_adaptation.bler_tables import BLERTableManager
-            from ..link_adaptation.effective_sinr import EESM
-            from ..link_adaptation.illa import ILLA
-            from ..link_adaptation.olla import OLLA
-            from ..link_adaptation.phy_abstraction import PHYAbstraction
-            self.bler_table = BLERTableManager()
-            self.eesm = EESM()
-            self.illa = ILLA(self.bler_table, self.la_config.bler_target,
-                             self.la_config.mcs_table_index,
-                             self.resource_grid.num_re_per_prb)
-            self.olla = OLLA(self.num_ue, self.illa, self.la_config.bler_target,
-                             self.la_config.olla_delta_up,
-                             self.la_config.olla_offset_min,
-                             self.la_config.olla_offset_max)
-            self.phy_abs = PHYAbstraction(self.bler_table, self.eesm,
-                                          self.resource_grid.num_re_per_prb,
-                                          self.la_config.mcs_table_index,
-                                          self.rng.phy)
+            from ..link_adaptation.legacy_phy_adapter import LegacyPHYAdapter
+            self.phy = LegacyPHYAdapter(
+                num_ue=self.num_ue,
+                bler_target=self.la_config.bler_target,
+                delta_up=self.la_config.olla_delta_up,
+                offset_min=self.la_config.olla_offset_min,
+                offset_max=self.la_config.olla_offset_max,
+                mcs_table_index=self.la_config.mcs_table_index,
+                num_re_per_prb=self.resource_grid.num_re_per_prb,
+                rng=self.rng.phy,
+            )
             self._use_sionna_phy = False
+        # 兼容旧代码引用
+        self.sionna_phy = self.phy if self._use_sionna_phy else None
 
         # 调度器 (通过 registry)
         sched_type = self.scheduler_config.type.lower()
@@ -153,7 +147,8 @@ class SimulationEngine:
         )
 
         # CSI 反馈 + SINR 预估
-        self._csi_enabled = self.csi_config.enabled and (channel_type == 'sionna')
+        # CSI 反馈支持所有信道后端（统计信道也输出 actual_channel_matrix）
+        self._csi_enabled = self.csi_config.enabled
         if self._csi_enabled:
             from ..csi.csi_feedback import CSIFeedbackManager
             from ..csi.sinr_prediction import SINRPredictor
@@ -183,10 +178,16 @@ class SimulationEngine:
 
         # HARQ 管理器
         from ..harq.harq_buffer import HARQManager
+        from ..config.sim_config import HARQConfig
+        harq_cfg = config.get('harq', HARQConfig())
+        ir_gains = {0: harq_cfg.ir_gain_rv0, 2: harq_cfg.ir_gain_rv2,
+                    3: harq_cfg.ir_gain_rv3, 1: harq_cfg.ir_gain_rv1}
         self.harq_mgr = HARQManager(
             num_ue=self.num_ue,
-            num_processes=16,
-            max_retx=4,
+            num_processes=harq_cfg.num_processes,
+            max_retx=harq_cfg.max_retx,
+            combining_type=harq_cfg.combining_type,
+            ir_gain_per_rv=ir_gains,
         )
         # per-UE 的活跃 HARQ process ID (-1 = 无)
         self._active_harq_pid = np.full(self.num_ue, -1, dtype=np.int32)
@@ -423,10 +424,7 @@ class SimulationEngine:
                 channel_state.sinr_per_prb[ue_idx, :r, :] /= r
                 channel_state.sinr_per_prb[ue_idx, r:, :] = 0.0
 
-        if self._use_sionna_phy:
-            return self._run_slot_sionna_phy(slot_ctx, channel_state, ue_rank)
-        else:
-            return self._run_slot_legacy_phy(slot_ctx, channel_state, ue_rank)
+        return self._run_slot_dl(slot_ctx, channel_state, ue_rank)
 
     def _build_harq_combined_sinr(self, raw_sinr_linear: np.ndarray,
                                   sched, retx_info: dict) -> np.ndarray:
@@ -440,245 +438,66 @@ class SimulationEngine:
             )
         return combined
 
-    def _compute_legacy_raw_sinr_linear(self, channel_state, mcs_indices,
-                                        ue_rank, sched) -> np.ndarray:
-        """Compute current-slot effective SINR before HARQ combining."""
-        from ..utils.math_utils import db_to_linear
-        num_ue = self.num_ue
-        raw_sinr_linear = np.zeros(num_ue, dtype=np.float32)
-        for ue in range(num_ue):
-            if sched.ue_num_prbs[ue] <= 0:
-                continue
-            n_layers = int(ue_rank[ue])
-            ue_prb_mask = (sched.prb_assignment == ue)
-            sinr_ue = channel_state.sinr_per_prb[ue, :n_layers, :][:, ue_prb_mask]
-            sinr_eff_db = self.eesm.compute(
-                sinr_ue,
-                int(mcs_indices[ue]),
-                self.la_config.mcs_table_index,
-            )
-            raw_sinr_linear[ue] = db_to_linear(sinr_eff_db)
-        return raw_sinr_linear
-
-    def _run_slot_sionna_phy(self, slot_ctx, channel_state, ue_rank):
-        """使用 Sionna PHY 层的 slot 处理 (含 HARQ)"""
+    def _run_slot_dl(self, slot_ctx, channel_state, ue_rank):
+        """统一 DL slot 处理 — 通过 PHY 接口抽象 Sionna/Legacy 差异"""
         num_ue = self.num_ue
         num_prb = self.carrier_config.num_prb
         re_per_prb = self.resource_grid.compute_re_per_prb(slot_ctx.num_dl_symbols)
         slot_idx = slot_ctx.slot_idx
 
-        # 初始 MCS (基于宽带 SINR 的保守估计，随后由 OLLA/CQI 细化)
+        # ── 1. MCS 选择 ──
         mcs_indices = np.zeros(num_ue, dtype=np.int32)
-
-        # --- SINR 预估 (CSI-based) ---
         sinr_eff_for_olla = self._last_sinr_eff.copy()
+
+        # CSI 预估 (仅 Sionna PHY + CSI 启用时生效)
         if self._csi_enabled and channel_state.actual_channel_matrix is not None:
             csi_reports = self.csi_manager.get_all_latest_reports()
-            # 使用估计信道进行预估 (模拟 gNB 侧行为)
             sinr_pred_db = self.sinr_predictor.predict_all_ue(
                 csi_reports, channel_state.estimated_channel_matrix, mode='su'
             )
             from ..utils.math_utils import db_to_linear
             from ..utils.cqi_utils import sinr_to_cqi, cqi_to_mcs
-            
+            # 获取 OLLA offsets 叠加到 CSI 预估 SINR (对标 AirView OLLA 乘法应用)
+            olla_offsets = np.zeros(num_ue)
+            if hasattr(self, 'olla') and self.olla is not None:
+                olla_offsets = self.olla.offsets
+            elif hasattr(self.phy, '_olla') and self.phy._olla is not None:
+                olla_obj = self.phy._olla
+                if hasattr(olla_obj, 'offsets'):
+                    olla_offsets = olla_obj.offsets
+                elif hasattr(olla_obj, '_offset'):
+                    olla_offsets = olla_obj._offset
             for ue in range(num_ue):
                 if csi_reports[ue] is not None and sinr_pred_db[ue] > -29:
-                    # 模拟 UE 端 SINR -> CQI -> gNB 端 MCS
-                    cqi = sinr_to_cqi(sinr_pred_db[ue])
+                    # CSI 路径叠加 OLLA offset (dB 域减法 = 线性域除法)
+                    sinr_adjusted = sinr_pred_db[ue] - olla_offsets[ue]
+                    cqi = sinr_to_cqi(sinr_adjusted)
                     mcs_indices[ue] = cqi_to_mcs(cqi)
                     sinr_eff_for_olla[ue] = db_to_linear(sinr_pred_db[ue])
 
-        # --- MCS 优化 (基于 OLLA 进一步细化) ---
-        est_re = np.full(num_ue, re_per_prb * max(num_prb // num_ue, 1), dtype=np.int32)
-        mcs_indices = self.sionna_phy.select_mcs(
+        # MCS 选择 (统一接口)
+        est_re = np.full(num_ue, re_per_prb * max(num_prb // max(num_ue, 1), 1), dtype=np.int32)
+        # Legacy PHY 需要 EESM sinr_eff_db 和 rank 信息
+        sinr_eff_db_for_legacy = None
+        if not self._use_sionna_phy:
+            sinr_eff_db_for_legacy = np.zeros(num_ue)
+            for ue in range(num_ue):
+                r = int(ue_rank[ue])
+                sinr_eff_db_for_legacy[ue] = self.phy.eesm.compute(
+                    channel_state.sinr_per_prb[ue, :r, :], mcs_index=0,
+                    table_index=self.la_config.mcs_table_index
+                )
+            self.phy.num_re_per_prb = re_per_prb
+        mcs_indices = self.phy.select_mcs(
             num_allocated_re=est_re,
             harq_feedback=self._last_harq.copy(),
             sinr_eff=sinr_eff_for_olla,
             scheduled_mask=self._last_scheduled_mask,
+            ue_rank=ue_rank,
+            sinr_eff_db=sinr_eff_db_for_legacy,
         )
 
-        # --- HARQ: 两阶段 peek → 调度 → consume，防止未调度 UE 的进程丢失 ---
-        has_retx = self.harq_mgr.has_any_retransmission()
-        retx_info = {}  # ue_id → retx_info dict
-        for ue in range(num_ue):
-            if has_retx[ue]:
-                info = self.harq_mgr.peek_retx_info(ue)  # 只读，不消费
-                if info is not None:
-                    retx_info[ue] = info
-                    mcs_indices[ue] = info['mcs']  # 重传用原始 MCS
-
-        # --- 可达速率 (Shannon 容量) ---
-        achievable_rate_per_prb = np.zeros((num_ue, num_prb))
-        for ue in range(num_ue):
-            r = int(ue_rank[ue])
-            sinr_prb = channel_state.sinr_per_prb[ue, :r, :]
-            capacity = np.sum(np.log2(1.0 + np.maximum(sinr_prb, 0)), axis=0)
-            # 重传 UE 给予更高优先级 (capacity ×2)
-            boost = 2.0 if ue in retx_info else 1.0
-            achievable_rate_per_prb[ue, :] = capacity * re_per_prb * boost
-
-        # --- PF 调度 ---
-        ue_buffer = np.array([ue.buffer_bytes for ue in self.ue_states])
-        for ue in retx_info:
-            ue_buffer[ue] = max(ue_buffer[ue], retx_info[ue]['tbs'] // 8)
-        sched = self.scheduler.schedule(
-            slot_ctx, self.ue_states, channel_state,
-            achievable_rate_per_prb, ue_buffer,
-            mcs_indices, ue_rank,
-            re_per_prb=re_per_prb,
-        )
-
-        # 调度完成后，消费已被调度的重传进程（未调度的保留在队列中）
-        for ue in retx_info:
-            if sched.ue_num_prbs[ue] > 0:
-                self.harq_mgr.consume_retx(ue)
-        
-        # --- L1 评估闭环: 计算 MU-MIMO 真实 SINR ---
-        if sched.mu_groups is not None:
-            from ..scheduler.mu_mimo_scheduler import compute_mu_mimo_sinr
-            from ..utils.math_utils import dbm_to_watt
-            
-            tx_pwr_prb = dbm_to_watt(self.cell_config.total_power_dbm) / num_prb
-            noise_pwr_prb = (1.3806e-23 * 290 * self.carrier_config.subcarrier_spacing * 1e3 * 12 
-                             * 10**(self.cell_config.noise_figure_db/10))
-            
-            # 物理层真实的 SINR 网格 (初始化为全 0)
-            actual_sinr_per_prb = np.zeros_like(channel_state.sinr_per_prb)
-
-            for prb in range(num_prb):
-                paired = sched.mu_groups[prb]
-                if not paired:
-                    continue
-                
-                # 计算该组 UE 在当前 PRB 的后处理 SINR (IRC 接收机)
-                mu_sinrs = compute_mu_mimo_sinr(
-                    channel_state.actual_channel_matrix,
-                    channel_state.estimated_channel_matrix,
-                    paired, prb, tx_pwr_prb, noise_pwr_prb
-                )
-                
-                for i, ue_idx in enumerate(paired):
-                    actual_sinr_per_prb[ue_idx, 0, prb] = mu_sinrs[i]
-            
-            # 使用受干扰影响的真实 SINR
-            phy_sinr_input = actual_sinr_per_prb
-        else:
-            phy_sinr_input = channel_state.sinr_per_prb
-
-        # --- PHY 评估 ---
-        ue_num_re = sched.ue_num_prbs * re_per_prb
-        raw_sinr_eff = self.sionna_phy.compute_sinr_eff(
-            phy_sinr_input, mcs_indices, sched.prb_assignment
-        )
-        combined_sinr_eff = self._build_harq_combined_sinr(
-            raw_sinr_eff, sched, retx_info
-        )
-        phy_results = self.sionna_phy.evaluate(
-            mcs_indices=mcs_indices,
-            sinr_per_re=phy_sinr_input,
-            num_allocated_re=ue_num_re.astype(np.int32),
-            prb_assignment=sched.prb_assignment,
-            sinr_eff_override=combined_sinr_eff,
-        )
-
-        # --- HARQ: K1 延迟反馈 ---
-        # PHY 判定结果不立即处理, 排入 K1 延迟队列
-        # decoded_bits 在 TX slot 记为 0, 在 feedback 到达时通过 deliver 记录
-        final_decoded_bits = np.zeros(num_ue, dtype=np.int64)
-
-        # 加上本 slot K1 到期交付的 decoded bits
-        final_decoded_bits += self.harq_mgr.get_delivered_decoded_bits()
-
-        for ue in range(num_ue):
-            is_scheduled = sched.ue_num_prbs[ue] > 0
-            if not is_scheduled:
-                continue
-
-            is_success = bool(phy_results['is_success'][ue])
-            sinr_linear = float(phy_results['sinr_eff_raw'][ue])
-            tbs = int(sched.ue_tbs_bits[ue])
-
-            # 计算 feedback 到达 slot
-            if self._is_tdd:
-                fb_slot = self.tdd.get_feedback_slot(slot_idx, self._harq_k1)
-            else:
-                fb_slot = slot_idx + self._harq_k1
-
-            if ue in retx_info:
-                # 重传: 排入 K1 队列
-                pid = retx_info[ue]['process_id']
-                self.harq_mgr.queue_feedback(
-                    fb_slot, ue, pid, is_success, sinr_linear, tbs
-                )
-            else:
-                # 新传输: 先注册 HARQ 进程, 再排入 K1 队列
-                if tbs > 0:
-                    pid = self.harq_mgr.start_new_tx(
-                        ue, int(mcs_indices[ue]), int(sched.ue_num_prbs[ue]),
-                        int(ue_rank[ue]), tbs, slot_idx
-                    )
-                    if pid >= 0:
-                        self._active_harq_pid[ue] = pid
-                        self.harq_mgr.queue_feedback(
-                            fb_slot, ue, pid, is_success, sinr_linear, tbs
-                        )
-
-        phy_results['decoded_bits'] = final_decoded_bits
-
-        # --- 更新状态 ---
-        self._last_harq = phy_results['harq_feedback'].copy()
-        self._last_sinr_eff = phy_results['sinr_eff_raw'].copy()
-        self._last_scheduled_mask = sched.ue_num_prbs > 0
-
-        sinr_eff_db = np.where(
-            phy_results['sinr_eff'] > 0,
-            linear_to_db(phy_results['sinr_eff']),
-            -30.0
-        )
-
-        return self._finalize_slot(slot_ctx, phy_results, mcs_indices,
-                                    ue_rank, sinr_eff_db, sched)
-
-    def _run_slot_legacy_phy(self, slot_ctx, channel_state, ue_rank):
-        """使用自实现 PHY 层的 slot 处理 (回退模式, 含 HARQ)"""
-        from ..utils.nr_utils import get_spectral_efficiency
-        num_ue = self.num_ue
-        num_prb = self.carrier_config.num_prb
-        re_per_prb = self.resource_grid.compute_re_per_prb(slot_ctx.num_dl_symbols)
-        slot_idx = slot_ctx.slot_idx
-
-        # OLLA 更新
-        self.olla.update_offsets_batch(
-            self._last_harq_ack, self._last_scheduled_mask
-        )
-
-        # EESM + MCS
-        sinr_eff_db = np.zeros(num_ue)
-        est_prbs = np.full(num_ue, max(num_prb // num_ue, 1), dtype=np.int32)
-        for ue in range(num_ue):
-            r = int(ue_rank[ue])
-            sinr_eff_db[ue] = self.eesm.compute(
-                channel_state.sinr_per_prb[ue, :r, :], mcs_index=0,
-                table_index=self.la_config.mcs_table_index
-            )
-        # TDD special slot uses fewer REs, which changes TBS/CBS and therefore
-        # the BLER-constrained MCS selected by ILLA.
-        self.illa.num_re_per_prb = re_per_prb
-        mcs_indices = self.olla.select_mcs(sinr_eff_db, est_prbs, ue_rank)
-
-        # Achievable rate (rank=1 fast path)
-        if np.all(ue_rank == 1):
-            sinr_r1 = channel_state.sinr_per_prb[:, 0, :]
-            achievable_rate_per_prb = np.log2(1.0 + np.maximum(sinr_r1, 0)) * re_per_prb
-        else:
-            achievable_rate_per_prb = np.zeros((num_ue, num_prb))
-            for ue in range(num_ue):
-                r = int(ue_rank[ue])
-                sinr_prb = channel_state.sinr_per_prb[ue, :r, :]
-                capacity = np.sum(np.log2(1.0 + np.maximum(sinr_prb, 0)), axis=0)
-                achievable_rate_per_prb[ue, :] = capacity * re_per_prb
-
-        # --- HARQ: peek retx ---
+        # ── 2. HARQ peek (两阶段: peek → 调度 → consume) ──
         has_retx = self.harq_mgr.has_any_retransmission()
         retx_info = {}
         for ue in range(num_ue):
@@ -688,81 +507,136 @@ class SimulationEngine:
                     retx_info[ue] = info
                     mcs_indices[ue] = info['mcs']
 
-        # PF 调度
+        # ── 3. 可达速率 (Shannon 容量 + 子带 PMI 增益) ──
+        achievable_rate_per_prb = np.zeros((num_ue, num_prb))
+        for ue in range(num_ue):
+            r = int(ue_rank[ue])
+            sinr_prb = channel_state.sinr_per_prb[ue, :r, :].copy()
+
+            # 子带 PMI: 使用子带预编码矩阵计算 post-PMI 波束成形增益
+            if (self._csi_enabled
+                    and channel_state.estimated_channel_matrix is not None):
+                report = self.csi_manager.get_latest_report(ue)
+                if (report is not None
+                        and report.precoding_matrices_subband is not None
+                        and len(report.precoding_matrices_subband) > 0):
+                    sb_size = self.csi_config.subband_size_prb
+                    h_est = channel_state.estimated_channel_matrix
+                    for sb_idx, prb_start in enumerate(range(0, num_prb, sb_size)):
+                        prb_end = min(prb_start + sb_size, num_prb)
+                        w_sb = report.precoding_matrices_subband[
+                            min(sb_idx, len(report.precoding_matrices_subband) - 1)
+                        ]
+                        # 计算子带平均信道 @ 子带 precoder 的波束成形增益
+                        h_sb = np.mean(h_est[ue, :, :, prb_start:prb_end], axis=2)
+                        h_eff = h_sb @ w_sb[:, :r]
+                        bf_power = np.sum(np.abs(h_eff) ** 2) / max(r, 1)
+                        # 与无预编码信道增益的比值
+                        raw_power = np.sum(np.abs(h_sb) ** 2) / max(h_sb.shape[1], 1)
+                        if raw_power > 0:
+                            bf_gain = np.clip(bf_power / raw_power, 0.5, 3.0)
+                            sinr_prb[:r, prb_start:prb_end] *= bf_gain
+
+            capacity = np.sum(np.log2(1.0 + np.maximum(sinr_prb, 0)), axis=0)
+            boost = 2.0 if ue in retx_info else 1.0
+            achievable_rate_per_prb[ue, :] = capacity * re_per_prb * boost
+
+        # ── 4. PF 调度 ──
         ue_buffer = np.array([ue.buffer_bytes for ue in self.ue_states])
         for ue in retx_info:
             ue_buffer[ue] = max(ue_buffer[ue], retx_info[ue]['tbs'] // 8)
         sched = self.scheduler.schedule(
             slot_ctx, self.ue_states, channel_state,
-            achievable_rate_per_prb, ue_buffer, mcs_indices, ue_rank,
+            achievable_rate_per_prb, ue_buffer,
+            mcs_indices, ue_rank,
             re_per_prb=re_per_prb,
         )
-
-        # Consume retx for scheduled UEs
         for ue in retx_info:
             if sched.ue_num_prbs[ue] > 0:
                 self.harq_mgr.consume_retx(ue)
 
-        # PHY 评估
-        raw_sinr_linear = self._compute_legacy_raw_sinr_linear(
-            channel_state, mcs_indices, ue_rank, sched
+        # ── 5. MU-MIMO 真实 SINR (如有) ──
+        phy_sinr_input = channel_state.sinr_per_prb
+        if sched.mu_groups is not None:
+            from ..scheduler.mu_mimo_scheduler import compute_mu_mimo_sinr
+            from ..utils.math_utils import dbm_to_watt
+            tx_pwr_prb = dbm_to_watt(self.cell_config.total_power_dbm) / num_prb
+            noise_pwr_prb = (1.3806e-23 * 290 * self.carrier_config.subcarrier_spacing * 1e3 * 12
+                             * 10**(self.cell_config.noise_figure_db / 10))
+            actual_sinr_per_prb = np.zeros_like(channel_state.sinr_per_prb)
+            for prb in range(num_prb):
+                paired = sched.mu_groups[prb]
+                if not paired:
+                    continue
+                mu_sinrs = compute_mu_mimo_sinr(
+                    channel_state.actual_channel_matrix,
+                    channel_state.estimated_channel_matrix,
+                    paired, prb, tx_pwr_prb, noise_pwr_prb,
+                    ue_rank=ue_rank
+                )
+                for i, ue_idx in enumerate(paired):
+                    actual_sinr_per_prb[ue_idx, 0, prb] = mu_sinrs[i]
+            phy_sinr_input = actual_sinr_per_prb
+
+        # ── 6. PHY 评估 (统一接口) ──
+        ue_num_re = sched.ue_num_prbs * re_per_prb
+        raw_sinr_eff = self.phy.compute_sinr_eff(
+            phy_sinr_input, mcs_indices, sched.prb_assignment
         )
-        combined_sinr_linear = self._build_harq_combined_sinr(
-            raw_sinr_linear, sched, retx_info
+        combined_sinr_eff = self._build_harq_combined_sinr(
+            raw_sinr_eff, sched, retx_info
         )
-        phy_results = self.phy_abs.evaluate_batch(
-            channel_state.sinr_per_prb, mcs_indices,
-            sched.ue_num_prbs, ue_rank, sched.prb_assignment,
+        phy_results = self.phy.evaluate(
+            mcs_indices=mcs_indices,
+            sinr_per_re=phy_sinr_input,
+            num_allocated_re=ue_num_re.astype(np.int32),
+            prb_assignment=sched.prb_assignment,
+            ue_rank=ue_rank,
             re_per_prb=re_per_prb,
-            sinr_eff_override_linear=combined_sinr_linear,
+            sinr_eff_override=combined_sinr_eff,
         )
 
-        # --- HARQ K1 feedback ---
-        final_decoded_bits = np.zeros(num_ue, dtype=np.int64)
-        final_decoded_bits += self.harq_mgr.get_delivered_decoded_bits()
+        # ── 7. HARQ K1 延迟反馈 ──
+        final_decoded_bits = self.harq_mgr.get_delivered_decoded_bits().copy()
 
-        from ..utils.math_utils import db_to_linear
         for ue in range(num_ue):
-            is_scheduled = sched.ue_num_prbs[ue] > 0
-            if not is_scheduled:
+            if sched.ue_num_prbs[ue] <= 0:
                 continue
-
             is_success = bool(phy_results['is_success'][ue])
-            sinr_linear = float(raw_sinr_linear[ue])
+            sinr_linear = float(phy_results['sinr_eff_raw'][ue])
             tbs = int(sched.ue_tbs_bits[ue])
-
-            if self._is_tdd:
-                fb_slot = self.tdd.get_feedback_slot(slot_idx, self._harq_k1)
-            else:
-                fb_slot = slot_idx + self._harq_k1
+            fb_slot = (self.tdd.get_feedback_slot(slot_idx, self._harq_k1)
+                       if self._is_tdd else slot_idx + self._harq_k1)
 
             if ue in retx_info:
                 pid = retx_info[ue]['process_id']
-                self.harq_mgr.queue_feedback(
-                    fb_slot, ue, pid, is_success, sinr_linear, tbs
+                self.harq_mgr.queue_feedback(fb_slot, ue, pid, is_success, sinr_linear, tbs)
+            elif tbs > 0:
+                pid = self.harq_mgr.start_new_tx(
+                    ue, int(mcs_indices[ue]), int(sched.ue_num_prbs[ue]),
+                    int(ue_rank[ue]), tbs, slot_idx
                 )
-            else:
-                if tbs > 0:
-                    pid = self.harq_mgr.start_new_tx(
-                        ue, int(mcs_indices[ue]), int(sched.ue_num_prbs[ue]),
-                        int(ue_rank[ue]), tbs, slot_idx
-                    )
-                    if pid >= 0:
-                        self._active_harq_pid[ue] = pid
-                        self.harq_mgr.queue_feedback(
-                            fb_slot, ue, pid, is_success, sinr_linear, tbs
-                        )
+                if pid >= 0:
+                    self._active_harq_pid[ue] = pid
+                    self.harq_mgr.queue_feedback(fb_slot, ue, pid, is_success, sinr_linear, tbs)
+                else:
+                    # HARQ 进程耗尽: TB 直接视为 ACK (无 HARQ 保护)
+                    if is_success:
+                        final_decoded_bits[ue] += tbs
 
         phy_results['decoded_bits'] = final_decoded_bits
 
-        # 更新状态
-        sinr_eff_db = phy_results['sinr_eff_db'].copy()
-        sinr_eff_db_raw = phy_results['sinr_eff_db_raw'].copy()
+        # ── 8. 状态更新 ──
+        self._last_harq = phy_results['harq_feedback'].copy()
         self._last_harq_ack = phy_results['is_success'].copy()
-        self._last_harq = np.where(phy_results['is_success'], 1, 0).astype(np.int32)
-        self._last_sinr_eff = db_to_linear(sinr_eff_db_raw).astype(np.float32)
+        self._last_sinr_eff = phy_results['sinr_eff_raw'].copy()
         self._last_scheduled_mask = sched.ue_num_prbs > 0
 
+        sinr_eff_db = np.where(
+            phy_results['sinr_eff'] > 0,
+            linear_to_db(phy_results['sinr_eff']),
+            -30.0
+        )
         return self._finalize_slot(slot_ctx, phy_results, mcs_indices,
                                     ue_rank, sinr_eff_db, sched)
 

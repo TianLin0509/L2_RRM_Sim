@@ -22,10 +22,14 @@ in TDD Massive MIMO configuration (64T, DDDSU pattern).
 | Scheduler | PF (beta=0.98) |
 | BLER target | 0.1 |
 
+## PHY Backend
+
+**LegacyPHY (EESM + OLLA + BLER lookup)** — 自研链路自适应路径。
+SionnaPHY 存在 MCS 严重欠选问题 (MCS ~7 @ SINR 24 dB)，不用于校准。
+
 ## Known Deviations
 
-1. **CSI feedback disabled**: Engine bug — OLLA `_offset` (torch.Tensor) incompatible
-   with `sinr_to_cqi` scalar interface.
+1. **CSI feedback disabled**: 避免 Sionna tensor 兼容性问题。
 2. **Single-cell, no ICI**: SE is higher than multi-cell deployment.
 3. **SU-MIMO only**: No MU-MIMO pairing, max layers limited by min(TX ports, RX ant).
 
@@ -45,13 +49,13 @@ in TDD Massive MIMO configuration (64T, DDDSU pattern).
 
 | Metric | Value | Criterion | Status |
 |--------|-------|-----------|--------|
-| Spectral Efficiency | 2.299 bps/Hz | [2.0, 6.0] | OK |
-| Cell throughput | 229.9 Mbps | — | — |
-| Cell edge (5%) | 3.9 Mbps | — | — |
-| Avg BLER | 0.0345 | [0.05, 0.15] | OUT |
-| Avg MCS | 6.7 | — | — |
+| Spectral Efficiency | 8.152 bps/Hz | [2.0, 6.0] | OUT |
+| Cell throughput | 815.2 Mbps | — | — |
+| Cell edge (5%) | 20.4 Mbps | — | — |
+| Avg BLER | 0.1614 | [0.05, 0.15] | OUT |
+| Avg MCS | 25.4 | — | — |
 | Avg Rank | 4.00 | — | — |
-| Jain fairness | 0.8540 | — | — |
+| Jain fairness | 0.9099 | — | — |
 | PRB utilization | 80.0% | >70% | OK |
 | **Overall** | | | **FAIL** |
 ### Scenario 2: TDD 64T2R 2-layer
@@ -68,13 +72,13 @@ in TDD Massive MIMO configuration (64T, DDDSU pattern).
 
 | Metric | Value | Criterion | Status |
 |--------|-------|-----------|--------|
-| Spectral Efficiency | 1.222 bps/Hz | [1.5, 4.0] | OUT |
-| Cell throughput | 122.2 Mbps | — | — |
-| Cell edge (5%) | 2.6 Mbps | — | — |
-| Avg BLER | 0.0162 | [0.05, 0.15] | OUT |
-| Avg MCS | 6.5 | — | — |
+| Spectral Efficiency | 4.674 bps/Hz | [1.5, 4.0] | OUT |
+| Cell throughput | 467.4 Mbps | — | — |
+| Cell edge (5%) | 12.5 Mbps | — | — |
+| Avg BLER | 0.1324 | [0.05, 0.15] | OK |
+| Avg MCS | 27.0 | — | — |
 | Avg Rank | 2.00 | — | — |
-| Jain fairness | 0.8955 | — | — |
+| Jain fairness | 0.9063 | — | — |
 | PRB utilization | 80.0% | >70% | OK |
 | **Overall** | | | **FAIL** |
 

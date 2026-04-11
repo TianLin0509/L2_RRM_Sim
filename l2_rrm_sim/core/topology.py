@@ -180,6 +180,55 @@ class HexGridTopology:
             dy = ue_pos[1] - cy
             return np.sqrt(dx**2 + dy**2)
 
+    def get_sector_boresight(self, cell_idx: int) -> float:
+        """获取指定小区的扇区指向角 (度)
+
+        Returns:
+            boresight angle in degrees (0, 120, or 240)
+        """
+        return float(self.sector_angles[self.cell_sector_ids[cell_idx]])
+
+    def compute_azimuth_to_cell(self, ue_pos: np.ndarray,
+                                 cell_idx: int) -> float:
+        """计算 UE 相对于小区的绝对方位角 (度, [-180, 180])
+
+        从小区看向 UE 的方位角 (用于天线方向图)。
+        含 wrap-around: 使用最短距离对应的方向。
+        """
+        cx, cy = self.cell_positions[cell_idx]
+
+        if self.wraparound:
+            min_dist = float('inf')
+            best_dx, best_dy = 0.0, 0.0
+            for offset in self._mirror_offsets:
+                dx = ue_pos[0] - (cx + offset[0])
+                dy = ue_pos[1] - (cy + offset[1])
+                dist = np.sqrt(dx**2 + dy**2)
+                if dist < min_dist:
+                    min_dist = dist
+                    best_dx, best_dy = dx, dy
+            return np.degrees(np.arctan2(best_dy, best_dx))
+        else:
+            dx = ue_pos[0] - cx
+            dy = ue_pos[1] - cy
+            return np.degrees(np.arctan2(dy, dx))
+
+    def compute_relative_azimuth(self, ue_pos: np.ndarray,
+                                  cell_idx: int) -> float:
+        """计算 UE 相对于扇区 boresight 的方位偏角 (度, [-180, 180])
+
+        0° = 正对扇区主瓣, ±60° = 扇区边缘, ±180° = 扇区背面
+        """
+        abs_azimuth = self.compute_azimuth_to_cell(ue_pos, cell_idx)
+        boresight = self.get_sector_boresight(cell_idx)
+        relative = abs_azimuth - boresight
+        # Wrap to [-180, 180]
+        while relative > 180.0:
+            relative -= 360.0
+        while relative < -180.0:
+            relative += 360.0
+        return relative
+
     def find_serving_cell(self, ue_pos: np.ndarray,
                           pathloss_func=None,
                           carrier_freq_ghz: float = 3.5) -> int:

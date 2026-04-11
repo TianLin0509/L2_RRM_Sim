@@ -46,8 +46,8 @@ LOS ratio: 19.4%
 
 | Metric | Simulated Median | Reference | Deviation | Status |
 |--------|-----------------|-----------|-----------|--------|
-| Multi-cell Coupling Loss (dB) | 112.8 | 110.0 | +2.8 | FAIL |
-| Multi-cell Geometry SINR (dB) | -3.7 | 6.0 | -9.7 | FAIL |
+| Multi-cell Coupling Loss (dB) | 107.1 | 110.0 | -2.9 | FAIL |
+| Multi-cell Geometry SINR (dB) | 7.4 | 6.0 | +1.4 | PASS |
 
 ## Conclusion
 

@@ -105,8 +105,14 @@ class StatisticalChannel(ChannelModelBase):
 
     def initialize(self, cell_config: CellConfig,
                    carrier_config: CarrierConfig,
-                   ue_states: list):
-        """初始化: 计算路径损耗和阴影衰落 (大尺度参数, 不随 TTI 变化)"""
+                   ue_states: list,
+                   sector_boresight_deg: float = 0.0):
+        """初始化: 计算路径损耗和阴影衰落 (大尺度参数, 不随 TTI 变化)
+
+        Args:
+            sector_boresight_deg: 扇区指向角 (度), 天线方向图以此为 0° 参考
+        """
+        self._sector_boresight_deg = sector_boresight_deg
         num_ue = len(ue_states)
         num_tx_ant = cell_config.num_tx_ant
         num_rx_ant = getattr(cell_config, 'num_rx_ant', 4)
@@ -166,13 +172,19 @@ class StatisticalChannel(ChannelModelBase):
         if self.channel_config.antenna_gain_enabled:
             self._antenna_gain_linear = np.ones(num_ue)
             for i, ue in enumerate(ue_states):
-                # 水平角: UE 相对 gNB 的方位角
-                phi_deg = np.degrees(np.arctan2(ue.position[1], ue.position[0]))
+                # 水平角: UE 相对扇区 boresight 的方位偏角
+                phi_abs = np.degrees(np.arctan2(ue.position[1], ue.position[0]))
+                phi_rel = phi_abs - self._sector_boresight_deg
+                # Wrap to [-180, 180]
+                while phi_rel > 180.0:
+                    phi_rel -= 360.0
+                while phi_rel < -180.0:
+                    phi_rel += 360.0
                 # 垂直角: 俯仰角 (从天顶算, 90度=水平)
                 d_2d = max(np.sqrt(ue.position[0]**2 + ue.position[1]**2), 10.0)
                 height_diff = cell_config.height_m - ue.position[2]
                 theta_deg = 90.0 + np.degrees(np.arctan2(height_diff, d_2d))
-                gain_dbi = antenna_gain_3gpp_element(theta_deg, phi_deg)
+                gain_dbi = antenna_gain_3gpp_element(theta_deg, phi_rel)
                 self._antenna_gain_linear[i] = db_to_linear(gain_dbi)
 
         # 重置 Jake's 缓存

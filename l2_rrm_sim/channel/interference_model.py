@@ -14,6 +14,7 @@
 
 import numpy as np
 from ..channel.pathloss_models import PATHLOSS_MODELS
+from ..channel.antenna_model import antenna_gain_3gpp_element
 from ..utils.math_utils import db_to_linear, dbm_to_watt, linear_to_db
 from ..core.nr_constants import BOLTZMANN_CONSTANT, STANDARD_TEMPERATURE, NUM_SC_PER_PRB
 
@@ -53,15 +54,20 @@ class InterCellInterference:
                             cell_positions: np.ndarray = None):
         """预计算所有 UE 到所有小区的路径损耗 (仿真开始时调一次)
 
+        含 TX 天线增益: 等效路损 = 路损(dB) - TX天线增益(dBi)
+        天线增益由各小区扇区方向图决定，需要 topology 提供扇区角度。
+
         Args:
             cell_ue_states: {cell_idx: [UEState, ...]}
-            topology: HexGridTopology (可选, 用于 wrap-around 距离)
+            topology: HexGridTopology (可选, 用于 wrap-around 距离和扇区方向图)
         """
         self._pathloss_cache.clear()
+        has_sector_info = (topology is not None
+                           and hasattr(topology, 'compute_relative_azimuth'))
+
         for serving_cell, ue_list in cell_ue_states.items():
             for ue_idx, ue in enumerate(ue_list):
                 ue_key = (serving_cell, ue_idx)
-                # 到所有小区的路径损耗
                 for cell_idx in range(self.num_cells):
                     if topology is not None:
                         d_2d = topology.compute_distance_2d(ue.position, cell_idx)
@@ -73,7 +79,22 @@ class InterCellInterference:
                     d_2d = max(d_2d, 10.0)
                     pl_db = self._pl_func(d_2d, self.cell_height, ue.position[2],
                                           self.carrier_freq_ghz, is_los=False)
-                    self._pathloss_cache[(ue_key, cell_idx)] = db_to_linear(pl_db)
+
+                    # TX 天线增益 (扇区方向图)
+                    tx_gain_db = 0.0
+                    if has_sector_info:
+                        phi_rel = topology.compute_relative_azimuth(
+                            ue.position, cell_idx)
+                        height_diff = self.cell_height - ue.position[2]
+                        theta_deg = 90.0 + np.degrees(
+                            np.arctan2(height_diff, d_2d))
+                        tx_gain_db = antenna_gain_3gpp_element(
+                            theta_deg, phi_rel)
+
+                    # 等效路损 = 路损 - TX增益 (增益越大, 等效路损越小)
+                    effective_pl_db = pl_db - tx_gain_db
+                    self._pathloss_cache[(ue_key, cell_idx)] = db_to_linear(
+                        effective_pl_db)
 
     def compute_static_interference(self, ue_key: tuple,
                                      serving_cell: int) -> float:

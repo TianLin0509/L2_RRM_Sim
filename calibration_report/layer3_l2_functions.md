@@ -1,100 +1,82 @@
-# Layer 3: L2 Functions Spectral Efficiency Calibration
+# Layer 3: L2 Functions — TDD Massive MIMO Calibration
 
 ## Overview
 
-Verify that the complete L2 stack (PF scheduler, link adaptation, HARQ)
-produces reasonable spectral efficiency compared to published references.
+Verify the L2 stack (PF scheduler, link adaptation, HARQ) spectral efficiency
+in TDD Massive MIMO configuration (64T, DDDSU pattern).
 
 ## Common Configuration
 
 | Parameter | Value |
 |-----------|-------|
-| Duplex | FDD |
+| Duplex | TDD DDDSU |
 | Bandwidth | 100 MHz |
 | SCS | 30 kHz |
 | PRBs | 273 |
 | Carrier freq | 3.5 GHz |
+| TX antennas | 64 |
+| BS power | 46 dBm |
 | Traffic | Full buffer |
 | Channel | Statistical UMa |
-| BS height | 25 m |
-| UE height | 1.5 m |
-| UE distance | [35, 500] m |
-| Cell radius | 500 m |
-| BS power | 46 dBm |
+| Slots | 2000 (warmup: 500) |
+| Scheduler | PF (beta=0.98) |
+| BLER target | 0.1 |
 
-## Deviations
+## Known Deviations
 
-1. **CSI feedback disabled**: Sionna OLLA `_offset` (torch.Tensor) is incompatible
-   with `sinr_to_cqi` (expects scalar float). The engine code at
-   `simulation_engine.py:473` subtracts a torch tensor from a numpy scalar,
-   producing a tensor that downstream `sinr_to_cqi` cannot handle.
-   CSI was disabled to allow simulation to complete. This may affect SE
-   (typically CSI improves MCS selection accuracy).
-
-2. **CPU-only execution**: Sionna PHYAbstraction rejects `cuda:0` device string.
-   Forced CPU via `torch.cuda.is_available` monkey-patch.
-
-3. **No inter-cell interference (ICI)**: Single-cell simulation without neighboring
-   cells. Reference values (Vienna SLS, R1-1801360) include 7-site 21-cell
-   deployment with full ICI. Missing ICI significantly inflates SINR and SE.
-   This is the primary cause of SE exceeding reference ranges.
+1. **CSI feedback disabled**: Engine bug — OLLA `_offset` (torch.Tensor) incompatible
+   with `sinr_to_cqi` scalar interface.
+2. **Single-cell, no ICI**: SE is higher than multi-cell deployment.
+3. **SU-MIMO only**: No MU-MIMO pairing, max layers limited by min(TX ports, RX ant).
 
 ## Results
 
-### Scenario 1: FDD 4x2 PF
+### Scenario 1: TDD 64T4R 4-layer
 
 | Parameter | Value |
 |-----------|-------|
-| TX antennas | 4 |
-| TX ports | 4 |
-| Max layers | 2 |
-| RX antennas | 2 |
-| UEs | 20 |
-| Scheduler | PF (beta=0.98) |
-| BLER target | 0.1 |
-| MCS table | 1 |
-| Channel | Statistical UMa |
-| Slots | 2000 (warmup: 500) |
-
-| Metric | Value |
-|--------|-------|
-| Spectral Efficiency | 3.427 bps/Hz |
-| Reference range | [1.8, 2.2] bps/Hz |
-| Acceptable range (+/-20%) | [1.44, 2.64] bps/Hz |
-| Cell throughput | 342.7 Mbps |
-| Avg BLER | 0.0713 |
-| Avg MCS | 11.9 |
-| Jain fairness | 0.7824 |
-| PRB utilization | 100.0% |
-| Elapsed time | 72.2s |
-| **Status** | **FAIL** |
-### Scenario 2: FDD 4x4 PF
-
-| Parameter | Value |
-|-----------|-------|
-| TX antennas | 4 |
+| TX antennas | 64 |
 | TX ports | 4 |
 | Max layers | 4 |
 | RX antennas | 4 |
 | UEs | 20 |
-| Scheduler | PF (beta=0.98) |
-| BLER target | 0.1 |
-| MCS table | 1 |
-| Channel | Statistical UMa |
-| Slots | 2000 (warmup: 500) |
+| Duplex | TDD DDDSU |
+| DL ratio | ~80% (3D + 0.7S out of 5 slots) |
 
-| Metric | Value |
-|--------|-------|
-| Spectral Efficiency | 5.444 bps/Hz |
-| Reference range | [2.0, 2.8] bps/Hz |
-| Acceptable range (+/-20%) | [1.60, 3.36] bps/Hz |
-| Cell throughput | 544.4 Mbps |
-| Avg BLER | 0.0927 |
-| Avg MCS | 10.8 |
-| Jain fairness | 0.6891 |
-| PRB utilization | 100.0% |
-| Elapsed time | 70.9s |
-| **Status** | **FAIL** |
+| Metric | Value | Criterion | Status |
+|--------|-------|-----------|--------|
+| Spectral Efficiency | 2.299 bps/Hz | [2.0, 6.0] | OK |
+| Cell throughput | 229.9 Mbps | — | — |
+| Cell edge (5%) | 3.9 Mbps | — | — |
+| Avg BLER | 0.0345 | [0.05, 0.15] | OUT |
+| Avg MCS | 6.7 | — | — |
+| Avg Rank | 4.00 | — | — |
+| Jain fairness | 0.8540 | — | — |
+| PRB utilization | 80.0% | >70% | OK |
+| **Overall** | | | **FAIL** |
+### Scenario 2: TDD 64T2R 2-layer
+
+| Parameter | Value |
+|-----------|-------|
+| TX antennas | 64 |
+| TX ports | 4 |
+| Max layers | 2 |
+| RX antennas | 2 |
+| UEs | 20 |
+| Duplex | TDD DDDSU |
+| DL ratio | ~80% (3D + 0.7S out of 5 slots) |
+
+| Metric | Value | Criterion | Status |
+|--------|-------|-----------|--------|
+| Spectral Efficiency | 1.222 bps/Hz | [1.5, 4.0] | OUT |
+| Cell throughput | 122.2 Mbps | — | — |
+| Cell edge (5%) | 2.6 Mbps | — | — |
+| Avg BLER | 0.0162 | [0.05, 0.15] | OUT |
+| Avg MCS | 6.5 | — | — |
+| Avg Rank | 2.00 | — | — |
+| Jain fairness | 0.8955 | — | — |
+| PRB utilization | 80.0% | >70% | OK |
+| **Overall** | | | **FAIL** |
 
 
 ## Figures
@@ -103,6 +85,4 @@ produces reasonable spectral efficiency compared to published references.
 
 ## Conclusion
 
-Pass criterion: Cell-average SE within reference range +/-20%
-
-**SOME SCENARIOS FAIL**
+**SOME METRICS OUT OF RANGE** — see individual scenario results.

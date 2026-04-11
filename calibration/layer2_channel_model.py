@@ -5,9 +5,13 @@ Part A: 独立验证路径损耗模型
   - 计算 LOS 概率、路径损耗、阴影衰落 → 耦合损耗 CDF
   - 参考中位数: 110 dB (TR 38.901 §7.8)
 
-Part B: 通过 SimulationEngine 验证几何 SINR
+Part B: 单小区 SimulationEngine 验证 (无 ICI, 仅供参考)
   - 200 UE, UMa 3.5GHz, 4Tx/2Rx, FDD, statistical channel
   - 50 slots, 收集宽带 SINR CDF
+
+Part C: 多小区 Geometry SINR (含 ICI, 正式对标 TR 38.901)
+  - 7-site 21-cell 部署, 10 UE/cell
+  - 从 InterCellInterference 缓存计算 geometry SINR
   - 参考中位数: 6.0 dB (TR 38.901 §7.8)
 
 Pass criteria: CDF 中位数偏差 <= 2 dB
@@ -181,7 +185,97 @@ def run_part_b():
     }
 
 
-def plot_cdf(result_a, result_b):
+def run_part_c():
+    """Part C: 多小区 Geometry SINR (含 ICI)"""
+    print("\n--- Part C: Multi-Cell Geometry SINR (with ICI) ---")
+
+    from l2_rrm_sim.config.sim_config import (
+        SimConfig, CarrierConfig, CellConfig, UEConfig,
+        SchedulerConfig, LinkAdaptationConfig, TrafficConfig, ChannelConfig,
+    )
+    from l2_rrm_sim.core.multicell_engine import MultiCellSimulationEngine
+    from l2_rrm_sim.utils.math_utils import linear_to_db
+
+    config = {
+        'sim': SimConfig(num_slots=10, random_seed=SEED, warmup_slots=0),
+        'carrier': CarrierConfig(
+            subcarrier_spacing=30, num_prb=273,
+            bandwidth_mhz=100.0, carrier_freq_ghz=FC_GHZ,
+        ),
+        'cell': CellConfig(
+            num_tx_ant=4, num_tx_ports=4, max_layers=2,
+            total_power_dbm=46.0, cell_radius_m=250.0,  # ISD=500m
+            height_m=H_BS, scenario='uma', noise_figure_db=5.0,
+        ),
+        'ue': UEConfig(
+            num_ue=10, num_rx_ant=2,
+            min_distance_m=R_MIN, height_m=H_UT,
+        ),
+        'scheduler': SchedulerConfig(type='pf'),
+        'link_adaptation': LinkAdaptationConfig(),
+        'traffic': TrafficConfig(type='full_buffer'),
+        'channel': ChannelConfig(type='statistical', scenario='uma'),
+    }
+
+    num_ue_per_cell = 10
+    engine = MultiCellSimulationEngine(
+        config, num_rings=1, num_ue_per_cell=num_ue_per_cell, ici_load_factor=1.0,
+    )
+    print(f"  Cells: {engine.num_cells}, UEs: {engine.total_ue}")
+
+    ici = engine.ici
+
+    # 计算每个 UE 的 geometry SINR 和 coupling loss
+    geometry_sinr_db = []
+    coupling_loss_db = []
+
+    for cell_idx in range(engine.num_cells):
+        for ue_idx in range(num_ue_per_cell):
+            ue_key = (cell_idx, ue_idx)
+
+            # 服务小区信号
+            pl_srv_linear = ici._pathloss_cache[(ue_key, cell_idx)]
+            signal = ici.tx_power_per_prb / pl_srv_linear
+
+            # 小区间干扰
+            intf = ici.compute_static_interference(ue_key, serving_cell=cell_idx)
+
+            sinr_linear = signal / (intf + ici.noise_power_per_prb)
+            sinr_db = float(linear_to_db(sinr_linear))
+            cl_db = float(linear_to_db(pl_srv_linear))
+
+            geometry_sinr_db.append(sinr_db)
+            coupling_loss_db.append(cl_db)
+
+    geometry_sinr_db = np.array(geometry_sinr_db)
+    coupling_loss_db = np.array(coupling_loss_db)
+
+    median_sinr = float(np.median(geometry_sinr_db))
+    median_cl = float(np.median(coupling_loss_db))
+    ref_sinr = REFERENCE_CHANNEL_UMA['geometry_sinr_median_db']
+    dev_sinr = median_sinr - ref_sinr
+
+    ref_cl = REFERENCE_CHANNEL_UMA['coupling_loss_median_db']
+    dev_cl = median_cl - ref_cl
+
+    print(f"  Multi-cell geometry SINR median: {median_sinr:.1f} dB (ref: {ref_sinr:.1f} dB)")
+    print(f"  Deviation: {dev_sinr:+.1f} dB  {'PASS' if abs(dev_sinr) <= 2.0 else 'FAIL'}")
+    print(f"  Multi-cell coupling loss median: {median_cl:.1f} dB (ref: {ref_cl:.1f} dB)")
+    print(f"  Deviation: {dev_cl:+.1f} dB  {'PASS' if abs(dev_cl) <= 2.0 else 'FAIL'}")
+
+    return {
+        'geometry_sinr_db': geometry_sinr_db,
+        'coupling_loss_db': coupling_loss_db,
+        'median_sinr': median_sinr,
+        'median_cl': median_cl,
+        'ref_sinr': ref_sinr,
+        'dev_sinr': dev_sinr,
+        'ref_cl': ref_cl,
+        'dev_cl': dev_cl,
+    }
+
+
+def plot_cdf(result_a, result_b, result_c=None):
     """并排绘制耦合损耗 CDF + SINR CDF"""
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
 
@@ -203,16 +297,20 @@ def plot_cdf(result_a, result_b):
     # --- SINR CDF ---
     sinr = np.sort(result_b['sinr_per_ue'])
     cdf2 = np.arange(1, len(sinr) + 1) / len(sinr)
-    ax2.plot(sinr, cdf2, 'b-', linewidth=2, label='Simulated')
-    ax2.axvline(result_b['median_sinr'], color='b', linestyle='--', alpha=0.7,
-                label=f"Median = {result_b['median_sinr']:.1f} dB")
+    ax2.plot(sinr, cdf2, 'b--', linewidth=1.5, alpha=0.5, label=f"Single-cell (median={result_b['median_sinr']:.1f})")
+
+    if result_c is not None:
+        sinr_mc = np.sort(result_c['geometry_sinr_db'])
+        cdf_mc = np.arange(1, len(sinr_mc) + 1) / len(sinr_mc)
+        ax2.plot(sinr_mc, cdf_mc, 'b-', linewidth=2, label=f"Multi-cell (median={result_c['median_sinr']:.1f})")
+
     ax2.axvline(result_b['ref_sinr'], color='r', linestyle='--', alpha=0.7,
-                label=f"Ref = {result_b['ref_sinr']:.1f} dB")
+                label=f"TR 38.901 ref = {result_b['ref_sinr']:.1f} dB")
     ax2.set_xlabel('Geometry SINR (dB)')
     ax2.set_ylabel('CDF')
     ax2.set_title('Geometry SINR CDF (UMa 3.5GHz)')
     ax2.legend(loc='lower right', fontsize=9)
-    ax2.set_xlim(REFERENCE_CHANNEL_UMA['geometry_sinr_range_db'])
+    ax2.set_xlim(-10, 35)
     ax2.grid(True, alpha=0.3)
 
     fig.tight_layout()
@@ -252,13 +350,33 @@ def plot_pathloss_vs_distance(result_a):
     save_figure(fig, 'layer2_pathloss_vs_distance')
 
 
-def generate_report(result_a, result_b):
+def generate_report(result_a, result_b, result_c=None):
     """生成校准报告"""
     pass_a = abs(result_a['dev_cl']) <= 2.0
-    pass_b = abs(result_b['dev_sinr']) <= 2.0
-    all_pass = pass_a and pass_b
-
     los_pct = 100 * result_a['is_los'].mean()
+
+    # 多小区是正式对标指标
+    if result_c is not None:
+        pass_sinr = abs(result_c['dev_sinr']) <= 2.0
+        pass_cl_mc = abs(result_c['dev_cl']) <= 2.0
+        all_pass = pass_a and pass_sinr and pass_cl_mc
+    else:
+        pass_sinr = abs(result_b['dev_sinr']) <= 2.0
+        pass_cl_mc = True
+        all_pass = pass_a and pass_sinr
+
+    mc_section = ""
+    if result_c is not None:
+        mc_section = f"""
+## Part C: Multi-Cell Geometry SINR (正式对标)
+
+7-site 21-cell 部署, ISD=500m, 10 UE/cell, full ICI (load_factor=1.0)
+
+| Metric | Simulated Median | Reference | Deviation | Status |
+|--------|-----------------|-----------|-----------|--------|
+| Multi-cell Coupling Loss (dB) | {result_c['median_cl']:.1f} | {result_c['ref_cl']:.1f} | {result_c['dev_cl']:+.1f} | {'PASS' if pass_cl_mc else 'FAIL'} |
+| Multi-cell Geometry SINR (dB) | {result_c['median_sinr']:.1f} | {result_c['ref_sinr']:.1f} | {result_c['dev_sinr']:+.1f} | {'PASS' if pass_sinr else 'FAIL'} |
+"""
 
     content = f"""# Layer 2: Channel Model Calibration
 
@@ -280,34 +398,33 @@ against TR 38.901 section 7.8 calibration references for UMa 3.5 GHz.
 | Shadow fading (LOS) | {SHADOW_STD_LOS} dB |
 | Shadow fading (NLOS) | {SHADOW_STD_NLOS} dB |
 | Part A UEs | {NUM_UE_PARTA} |
-| Part B UEs | {NUM_UE_PARTB} |
-| Part B slots | {NUM_SLOTS_PARTB} |
-| Part B config | 4Tx/2Rx, FDD, statistical channel |
+| Part B UEs | {NUM_UE_PARTB} (single-cell, no ICI) |
+| Part C | 7-site 21-cell, 10 UE/cell, ISD=500m |
 
-## Part A: Coupling Loss CDF
+## Part A: Coupling Loss CDF (独立路损验证)
 
 LOS ratio: {los_pct:.1f}%
-
-![Coupling Loss CDF](figures/layer2_channel_cdf.png)
-
-![Pathloss vs Distance](figures/layer2_pathloss_vs_distance.png)
-
-## Part B: Geometry SINR CDF
-
-## CDF Comparison
 
 | Metric | Simulated Median | Reference | Deviation | Status |
 |--------|-----------------|-----------|-----------|--------|
 | Coupling Loss (dB) | {result_a['median_cl']:.1f} | {result_a['ref_cl']:.1f} | {result_a['dev_cl']:+.1f} | {'PASS' if pass_a else 'FAIL'} |
-| Geometry SINR (dB) | {result_b['median_sinr']:.1f} | {result_b['ref_sinr']:.1f} | {result_b['dev_sinr']:+.1f} | {'PASS' if pass_b else 'FAIL'} |
+
+![CDF Comparison](figures/layer2_channel_cdf.png)
+
+![Pathloss vs Distance](figures/layer2_pathloss_vs_distance.png)
+
+## Part B: Single-Cell SINR (参考, 无 ICI)
+
+| Metric | Value |
+|--------|-------|
+| Single-cell SINR median | {result_b['median_sinr']:.1f} dB |
+| Note | 无小区间干扰, 不直接对标 TR 38.901 |
+{mc_section}
+## Conclusion
 
 Pass criterion: CDF median deviation <= 2 dB
 
-## Conclusion
-
 **{'ALL PASS' if all_pass else 'SOME METRICS EXCEED THRESHOLD'}**
-
-{'All metrics within 2 dB of TR 38.901 reference values.' if all_pass else 'One or more metrics deviate by more than 2 dB from reference.'}
 """
     write_report('layer2_channel_model.md', content)
 
@@ -323,27 +440,43 @@ def main():
     # Part A
     result_a = run_part_a(rng)
 
-    # Part B
+    # Part B (single-cell, reference only)
     result_b = run_part_b()
 
+    # Part C (multi-cell, official benchmark)
+    result_c = None
+    try:
+        result_c = run_part_c()
+    except Exception as e:
+        print(f"  Part C failed: {e}")
+        print("  Falling back to single-cell results only")
+
     # Plots
-    plot_cdf(result_a, result_b)
+    plot_cdf(result_a, result_b, result_c)
     plot_pathloss_vs_distance(result_a)
 
     # Report
-    generate_report(result_a, result_b)
+    generate_report(result_a, result_b, result_c)
 
     # Summary
     print("\n" + "=" * 60)
     pass_a = abs(result_a['dev_cl']) <= 2.0
-    pass_b = abs(result_b['dev_sinr']) <= 2.0
-    print(f"  Coupling Loss: median={result_a['median_cl']:.1f} dB, "
+    print(f"  Part A Coupling Loss: median={result_a['median_cl']:.1f} dB, "
           f"ref={result_a['ref_cl']:.1f} dB, "
           f"dev={result_a['dev_cl']:+.1f} dB  {'PASS' if pass_a else 'FAIL'}")
-    print(f"  Geometry SINR: median={result_b['median_sinr']:.1f} dB, "
-          f"ref={result_b['ref_sinr']:.1f} dB, "
-          f"dev={result_b['dev_sinr']:+.1f} dB  {'PASS' if pass_b else 'FAIL'}")
-    overall = "ALL PASS" if (pass_a and pass_b) else "SOME FAIL"
+    print(f"  Part B Single-cell SINR: median={result_b['median_sinr']:.1f} dB (no ICI, reference only)")
+    if result_c is not None:
+        pass_c_sinr = abs(result_c['dev_sinr']) <= 2.0
+        pass_c_cl = abs(result_c['dev_cl']) <= 2.0
+        print(f"  Part C Multi-cell SINR: median={result_c['median_sinr']:.1f} dB, "
+              f"ref={result_c['ref_sinr']:.1f} dB, "
+              f"dev={result_c['dev_sinr']:+.1f} dB  {'PASS' if pass_c_sinr else 'FAIL'}")
+        print(f"  Part C Multi-cell CL:   median={result_c['median_cl']:.1f} dB, "
+              f"ref={result_c['ref_cl']:.1f} dB, "
+              f"dev={result_c['dev_cl']:+.1f} dB  {'PASS' if pass_c_cl else 'FAIL'}")
+        overall = "ALL PASS" if (pass_a and pass_c_sinr and pass_c_cl) else "SOME FAIL"
+    else:
+        overall = "PARTIAL (multi-cell unavailable)"
     print(f"  Overall: {overall}")
     print("=" * 60)
 

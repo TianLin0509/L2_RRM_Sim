@@ -18,31 +18,39 @@ against TR 38.901 section 7.8 calibration references for UMa 3.5 GHz.
 | Shadow fading (LOS) | 4.0 dB |
 | Shadow fading (NLOS) | 6.0 dB |
 | Part A UEs | 2000 |
-| Part B UEs | 200 |
-| Part B slots | 50 |
-| Part B config | 4Tx/2Rx, FDD, statistical channel |
+| Part B UEs | 200 (single-cell, no ICI) |
+| Part C | 7-site 21-cell, 10 UE/cell, ISD=500m |
 
-## Part A: Coupling Loss CDF
+## Part A: Coupling Loss CDF (独立路损验证)
 
 LOS ratio: 8.8%
-
-![Coupling Loss CDF](figures/layer2_channel_cdf.png)
-
-![Pathloss vs Distance](figures/layer2_pathloss_vs_distance.png)
-
-## Part B: Geometry SINR CDF
-
-## CDF Comparison
 
 | Metric | Simulated Median | Reference | Deviation | Status |
 |--------|-----------------|-----------|-----------|--------|
 | Coupling Loss (dB) | 122.5 | 110.0 | +12.5 | FAIL |
-| Geometry SINR (dB) | 22.3 | 6.0 | +16.3 | FAIL |
 
-Pass criterion: CDF median deviation <= 2 dB
+![CDF Comparison](figures/layer2_channel_cdf.png)
+
+![Pathloss vs Distance](figures/layer2_pathloss_vs_distance.png)
+
+## Part B: Single-Cell SINR (参考, 无 ICI)
+
+| Metric | Value |
+|--------|-------|
+| Single-cell SINR median | 22.3 dB |
+| Note | 无小区间干扰, 不直接对标 TR 38.901 |
+
+## Part C: Multi-Cell Geometry SINR (正式对标)
+
+7-site 21-cell 部署, ISD=500m, 10 UE/cell, full ICI (load_factor=1.0)
+
+| Metric | Simulated Median | Reference | Deviation | Status |
+|--------|-----------------|-----------|-----------|--------|
+| Multi-cell Coupling Loss (dB) | 112.8 | 110.0 | +2.8 | FAIL |
+| Multi-cell Geometry SINR (dB) | -3.7 | 6.0 | -9.7 | FAIL |
 
 ## Conclusion
 
-**SOME METRICS EXCEED THRESHOLD**
+Pass criterion: CDF median deviation <= 2 dB
 
-One or more metrics deviate by more than 2 dB from reference.
+**SOME METRICS EXCEED THRESHOLD**

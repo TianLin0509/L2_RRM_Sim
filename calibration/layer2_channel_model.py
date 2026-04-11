@@ -38,7 +38,7 @@ from l2_rrm_sim.channel.pathloss_models import (
 # ---- 配置 ----
 NUM_UE_PARTA = 2000
 R_MIN = 35.0    # m
-R_MAX = 500.0   # m
+R_MAX = 250.0   # m (ISD=500m → cell_radius=250m, 对齐 TR 38.901)
 H_BS = 25.0     # m
 H_UT = 1.5      # m
 FC_GHZ = 3.5
@@ -133,7 +133,7 @@ def run_part_b():
             num_ue=NUM_UE_PARTB,
             num_rx_ant=2,
             min_distance_m=R_MIN,
-            max_distance_m=R_MAX,
+            max_distance_m=250.0,
             height_m=H_UT,
             speed_kmh=3.0,
         ),

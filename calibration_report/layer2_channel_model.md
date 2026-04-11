@@ -13,7 +13,7 @@ against TR 38.901 section 7.8 calibration references for UMa 3.5 GHz.
 | Carrier frequency | 3.5 GHz |
 | BS height | 25.0 m |
 | UE height | 1.5 m |
-| Cell radius | 500.0 m |
+| Cell radius | 250.0 m |
 | Min distance | 35.0 m |
 | Shadow fading (LOS) | 4.0 dB |
 | Shadow fading (NLOS) | 6.0 dB |
@@ -23,11 +23,11 @@ against TR 38.901 section 7.8 calibration references for UMa 3.5 GHz.
 
 ## Part A: Coupling Loss CDF (独立路损验证)
 
-LOS ratio: 8.8%
+LOS ratio: 19.4%
 
 | Metric | Simulated Median | Reference | Deviation | Status |
 |--------|-----------------|-----------|-----------|--------|
-| Coupling Loss (dB) | 122.5 | 110.0 | +12.5 | FAIL |
+| Coupling Loss (dB) | 110.0 | 110.0 | +0.0 | PASS |
 
 ![CDF Comparison](figures/layer2_channel_cdf.png)
 
@@ -37,7 +37,7 @@ LOS ratio: 8.8%
 
 | Metric | Value |
 |--------|-------|
-| Single-cell SINR median | 22.3 dB |
+| Single-cell SINR median | 35.7 dB |
 | Note | 无小区间干扰, 不直接对标 TR 38.901 |
 
 ## Part C: Multi-Cell Geometry SINR (正式对标)

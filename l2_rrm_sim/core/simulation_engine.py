@@ -466,11 +466,16 @@ class SimulationEngine:
                 if hasattr(olla_obj, 'offsets'):
                     olla_offsets = olla_obj.offsets
                 elif hasattr(olla_obj, '_offset'):
-                    olla_offsets = olla_obj._offset
+                    _raw = olla_obj._offset
+                    # Sionna OLLA _offset 是 torch.Tensor，需转 numpy
+                    if hasattr(_raw, 'cpu'):
+                        olla_offsets = _raw.cpu().numpy().ravel()
+                    else:
+                        olla_offsets = np.asarray(_raw).ravel()
             for ue in range(num_ue):
                 if csi_reports[ue] is not None and sinr_pred_db[ue] > -29:
                     # CSI 路径叠加 OLLA offset (dB 域减法 = 线性域除法)
-                    sinr_adjusted = sinr_pred_db[ue] - olla_offsets[ue]
+                    sinr_adjusted = float(sinr_pred_db[ue] - olla_offsets[ue])
                     cqi = sinr_to_cqi(sinr_adjusted)
                     mcs_indices[ue] = cqi_to_mcs(cqi)
                     sinr_eff_for_olla[ue] = db_to_linear(sinr_pred_db[ue])

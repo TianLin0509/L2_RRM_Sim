@@ -36,6 +36,14 @@
 
 ### 🔴 P0 — 必须修复
 
+#### 0. MultiCellEngine 不支持 TDD slot pattern
+**现象**: 多小区仿真只能跑 FDD，TDD DDDSU 仅单小区可用。
+**影响**: 
+- 无法精确复现 ITU-R M.2412 TDD 多小区场景
+- Layer 4 多小区 smoke 退回 FDD，SE 数值对比打折扣
+- 用户主场景是 TDD Massive MIMO，这是**核心能力缺失**
+**建议**: MultiCellEngine 集成 TDDConfig，`_make_slot_context` 按 DDDSU 模式返回 direction，并过滤 UL slot 不参与 DL 调度。
+
 #### 1. Sionna PHY 严重 MCS 欠选
 **现象**: SINR 24 dB 时 Sionna PHY 选 MCS 7，而 Legacy PHY 选 MCS 25（正确值）。
 **影响**: SE 从应有的 9 bps/Hz 降到 2.3 bps/Hz（-74%）。
@@ -82,15 +90,7 @@
 - 研究自适应 initial_offset（例如基于最近 CQI 反馈猜测起点）
 - 或 `ack_step/nack_step` 步长自适应（初期快收敛，稳态时小步微调）
 
-#### 7. MultiCellEngine 不支持 TDD slot pattern
-**现象**: 多小区仿真只能跑 FDD，单小区可以 TDD。
-**影响**: 无法精确复现 ITU-R M.2412 的 TDD 多小区场景。
-**建议**: MultiCellEngine 集成 TDDConfig，让 `_make_slot_context` 按 DDDSU 返回 direction。
-
-#### 8. BLER 表最大 CBS=2000 限制校准精度
-**与 P0 第 2 项同因**，已归入 P0。
-
-#### 9. Layer 1 参考值是估值
+#### 7. Layer 1 参考值是估值
 **现象**: 最初 `REFERENCE_BLER_10PCT` 是文献估读，误差 2-3 dB。后用 3GPP CQI SINR 阈值（R1-073505）做精确映射修正。
 **当前状态**: 已修正，QPSK 精确匹配；16/64QAM 剩余偏差来自 CBS 钳位（P0）。
 **建议**: 后续若需进一步提升精度，用 MATLAB 5G Toolbox 跑独立参考曲线替代。
@@ -141,13 +141,13 @@
 ## 后续优先改进路线图
 
 ### 立即可做（本周）
-1. **P0-1**: 重新导出覆盖更大 CBS 的 BLER 表（需要 Sionna 跑一次扫描）
-2. **P1-3**: 天线方向图波宽参数化（改 3 行代码 + 一组测试）
+1. **P0-0**: MultiCellEngine 支持 TDD（核心能力缺失）
+2. **P0-1**: 重新导出覆盖更大 CBS 的 BLER 表（需要 Sionna 跑一次扫描）
+3. **P1-3**: 天线方向图波宽参数化（改 3 行代码 + 一组测试）
 
 ### 短期（2-4 周）
-3. **P0-2**: 排查 Sionna PHY MCS 欠选根因
-4. **P1-5**: CSI 路径 numpy/tensor 接口重构
-5. **P2-7**: MultiCellEngine 支持 TDD
+4. **P0-2**: 排查 Sionna PHY MCS 欠选根因
+5. **P1-5**: CSI 路径 numpy/tensor 接口重构
 
 ### 长期（1-3 月）
 6. **P1-4**: ILLA-调度器 iteration 或动态 PRB 估计

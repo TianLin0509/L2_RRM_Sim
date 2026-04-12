@@ -1,6 +1,46 @@
 # L2_RRM_Sim 工作进度记录
 
-更新时间：2026-03-31
+更新时间：2026-04-12
+
+---
+
+## 🎯 后续改进路线图（来自 2026-04-12 四层校准）
+
+完整分析见 `calibration_report/summary.md`。按优先级：
+
+### 🔴 P0 — 必须修复
+
+- [ ] **P0-0: MultiCellEngine 支持 TDD DDDSU slot pattern**
+  - 当前多小区只能 FDD，用户主场景是 TDD Massive MIMO
+  - 需要集成 TDDConfig 到 `_make_slot_context` 和 `_run_cell_slot`
+- [ ] **P0-1: BLER 表扩展到大 CBS (>=8448)**
+  - 当前表最大 CBS=2000，实际 273 PRB rank=1 CBS=7000-8400，被钳位
+  - 重新从 Sionna 导出覆盖更大 CBS 的 PDSCH_table*.json
+- [ ] **P0-2: 排查 Sionna PHY MCS 严重欠选**
+  - SINR 24 dB 时 Sionna 选 MCS 7 (应为 25)，SE 降 74%
+  - 疑似 Sionna OLLA _offset 初始化/收敛逻辑不匹配
+
+### 🟡 P1 — 重要
+
+- [ ] **P1-3: 天线方向图波宽参数化**
+  - 当前 3GPP 标准值 θ₃dB=65°，华为实际产品 110°
+  - `antenna_gain_3gpp_element` 支持从 config 读取波宽
+- [ ] **P1-4: ILLA-调度器 iteration 或动态 PRB 估计**
+  - ILLA 用均分假设（27 PRB/UE），实际集中分配（272 PRB/UE）
+  - 探索两轮 iteration 或动态 PRB 数估计
+- [ ] **P1-5: CSI 路径 Sionna Tensor 兼容性**
+  - `sinr_to_cqi(torch.Tensor)` 类型不兼容
+  - 重构 CSI 路径接口统一为 numpy ndarray
+
+### 🟢 P2 — 改进
+
+- [ ] **P2-6: OLLA 自适应初始值/步长**
+  - 商用默认 init=-4 需 5000+ slots 收敛
+  - 探索基于最近 CQI 反馈猜测起点，或步长自适应
+- [ ] **P2-7: Layer 1 参考值用 MATLAB 5G Toolbox 精确曲线替代**
+  - 当前用 3GPP CQI SINR 阈值映射，有码率不匹配插值
+- [ ] **P2-8: 加入 MU-MIMO + 64R UE 支持**
+  - 对标 ITU-R M.2412 Dense Urban eMBB 7.8 bps/Hz
 
 ---
 

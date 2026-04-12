@@ -151,6 +151,10 @@ def run_scenario(s: dict, idx: int) -> dict:
         engine._use_sionna_phy = False
         engine.sionna_phy = None
 
+    # 校准场景: OLLA 初始值设为 0 加速收敛 (默认 -4 需要 5000+ slots)
+    # 商用默认仍保留 -4 (华为方案)
+    engine.phy.olla.reset(initial_offset=0.0)
+
     report = engine.run()
     elapsed = time.time() - t0
 
@@ -253,10 +257,13 @@ def run_multicell_scenario(s: dict, idx: int) -> dict:
             illa = ILLA(bt, mc_engine.la_config.bler_target,
                         mc_engine.la_config.mcs_table_index,
                         mc_engine.resource_grid.num_re_per_prb)
+            olla = OLLA(s['num_ue'], illa,
+                        bler_target=mc_engine.la_config.bler_target,
+                        mcs_table_index=mc_engine.la_config.mcs_table_index)
+            # 校准场景: OLLA 初始值 0 加速收敛
+            olla.reset(initial_offset=0.0)
             mc_engine.cell_phy[cell_idx] = {
-                'olla': OLLA(s['num_ue'], illa,
-                             mc_engine.la_config.bler_target,
-                             mc_engine.la_config.olla_delta_up),
+                'olla': olla,
                 'eesm': eesm,
             }
         mc_engine._use_sionna_phy = False

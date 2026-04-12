@@ -472,12 +472,14 @@ class SimulationEngine:
                         olla_offsets = _raw.cpu().numpy().ravel()
                     else:
                         olla_offsets = np.asarray(_raw).ravel()
+            max_mcs = 27 if self.la_config.mcs_table_index == 1 else 27
             for ue in range(num_ue):
                 if csi_reports[ue] is not None and sinr_pred_db[ue] > -29:
-                    # CSI 路径叠加 OLLA offset (dB 域减法 = 线性域除法)
-                    sinr_adjusted = float(sinr_pred_db[ue] - olla_offsets[ue])
-                    cqi = sinr_to_cqi(sinr_adjusted)
-                    mcs_indices[ue] = cqi_to_mcs(cqi)
+                    # CSI 路径: 先用原始 SINR 得到基础 MCS, 再叠加 OLLA offset (MCS 域)
+                    cqi = sinr_to_cqi(float(sinr_pred_db[ue]))
+                    base_mcs = cqi_to_mcs(cqi)
+                    final_mcs = int(round(base_mcs + float(olla_offsets[ue])))
+                    mcs_indices[ue] = max(0, min(final_mcs, max_mcs))
                     sinr_eff_for_olla[ue] = db_to_linear(sinr_pred_db[ue])
 
         # MCS 选择 (统一接口)

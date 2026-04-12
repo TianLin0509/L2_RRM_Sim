@@ -151,8 +151,9 @@ class MultiCellSimulationEngine:
                             self.la_config.mcs_table_index,
                             self.resource_grid.num_re_per_prb)
                 self.cell_phy[cell_idx] = {
-                    'olla': OLLA(num_ue_per_cell, illa, self.la_config.bler_target,
-                                 self.la_config.olla_delta_up),
+                    'olla': OLLA(num_ue_per_cell, illa,
+                                 bler_target=self.la_config.bler_target,
+                                 mcs_table_index=self.la_config.mcs_table_index),
                     'eesm': eesm,
                 }
 
